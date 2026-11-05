@@ -3,7 +3,7 @@
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、版の付け方は [Semantic Versioning](https://semver.org/lang/ja/) に従います。
 括弧内の ID（R1、F1、U1、O1 など）は、Payback Management 3.6.0 の精査と改善提案の番号です。
 
-## [4.0.0] - 2026-11-06
+## 4.0.0 - 2026-11-06
 
 Payback Management 3.6.0 の後継として、名前を **CLEAR** に変え、作り直しました。
 データの形式が変わるため、メジャー更新です。旧版のデータは取り込み（コピー）で移行し、元のファイルは変更しません。
@@ -54,5 +54,3 @@ Payback Management 3.6.0 の後継として、名前を **CLEAR** に変え、�
 ### 削除
 
 - 開発者のメールアドレスの表示（「このアプリについて」は開発者名と GitHub のリンクのみ）
-
-[4.0.0]: https://github.com/zhuyushuyo/CLEAR/releases/tag/v4.0.0
