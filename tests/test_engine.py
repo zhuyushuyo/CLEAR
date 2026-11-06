@@ -154,12 +154,13 @@ def test_managed_card_is_not_counted_twice():
 
 def test_alerts():
     st = make_state(
-        bills=[loan(amount=300000, interest_rate=18.0, monthly_payment=4000, monthly_due_day=3),
-               loan(id=2, bill_name="Soon", monthly_due_day=8)],
+        bills=[loan(amount=300000, interest_rate=18.0, monthly_payment=4000, monthly_due_day=3, auto_debit=False),
+               loan(id=2, bill_name="Soon", monthly_due_day=9),
+               loan(id=3, bill_name="Debited", monthly_due_day=2)],
         cards=[CreditCard(id=1, name="Gold", used_amount=90000, credit_limit=100000)],
         today=date(2026, 11, 6))
     codes = {a.code for a in engine.home_summary(st, RATES, "JPY", rates_age_days=10).alerts}
-    assert {"underwater", "overdue", "due_soon", "rates_stale", "card_util"} <= codes
+    assert {"underwater", "overdue", "pending_debit", "due_soon", "rates_stale", "card_util"} <= codes
 
 
 def test_due_close_periods():

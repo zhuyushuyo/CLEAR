@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date
 
 from PyQt6.QtCore import QDate, QLocale, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QIcon
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QIcon
 from PyQt6.QtWidgets import (QAbstractItemView, QComboBox, QDateEdit, QDoubleSpinBox, QFrame, QHBoxLayout,
                              QHeaderView, QLabel, QMessageBox, QPushButton, QSizePolicy, QTableWidget,
                              QTableWidgetItem, QVBoxLayout, QWidget)
@@ -109,11 +109,16 @@ class Card(QFrame):
 
 
 class KpiCard(QFrame):
+    """A titled number. The number's font shrinks (25 → 16 px) when the card is narrow, so a row of
+    cards never forces the page wider than the window."""
+
+    MAX_PX, MIN_PX = 25, 16
+
     def __init__(self, title: str, icon_name: str = "", parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("Card")
-        self.setFixedHeight(132)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumHeight(132)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(18, 14, 18, 14)
         lay.setSpacing(4)
@@ -127,6 +132,9 @@ class KpiCard(QFrame):
         lay.addLayout(head)
         self.value = label("—", "KpiValue")
         self.value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.value.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.value.setMinimumWidth(1)
+        self._px = self.MAX_PX
         lay.addWidget(self.value)
         self.sub = label("", "KpiSub", wrap=True)
         lay.addWidget(self.sub)
@@ -136,6 +144,26 @@ class KpiCard(QFrame):
         self.value.setText(value)
         self.sub.setText(sub)
         set_tone(self.value, tone)
+        self._fit()
+
+    def _fit(self) -> None:
+        room = self.value.width() if self.value.width() > 10 else self.width() - 36
+        if room <= 10:
+            return
+        font = QFont(self.value.font())
+        px = self.MAX_PX
+        while px > self.MIN_PX:
+            font.setPixelSize(px)
+            if QFontMetrics(font).horizontalAdvance(self.value.text()) <= room:
+                break
+            px -= 1
+        if px != self._px:
+            self._px = px
+            self.value.setStyleSheet(f"font-size: {px}px;" if px != self.MAX_PX else "")
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit()
 
 
 class Banner(QFrame):

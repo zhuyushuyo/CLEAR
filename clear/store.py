@@ -14,11 +14,12 @@ from pathlib import Path
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
-from . import backup, db, engine, logsetup, paths, rates
+from . import backup, db, engine, invest, logsetup, market, paths, rates
 from .config import AppConfig, save_config
-from .models import Bill, CreditCard, LivingCost, Profile
+from .models import Bill, CreditCard, Holding, LivingCost, NetWorthPoint, Profile
+from .money import CURRENCIES, convert
 from .periods import Period
-from .repo import ClosePlan, Repository
+from .repo import ClosePlan, ContribBuy, Repository
 
 log = logging.getLogger(__name__)
 
@@ -34,10 +35,44 @@ class RateWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class MarketWorker(QThread):
+    done = pyqtSignal(object)       # market.MarketResult
+
+    def __init__(self, request: market.MarketRequest, parent=None):
+        super().__init__(parent)
+        self.request = request
+
+    def run(self) -> None:  # worker thread: never touches widgets
+        try:
+            result = market.refresh(self.request)
+        except Exception as exc:  # pragma: no cover - refresh() already guards each source
+            result = market.MarketResult(fetched_at=market.now_text())
+            result.errors.append(str(exc))
+        self.done.emit(result)
+
+
+class TaskWorker(QThread):
+    """Runs one blocking call (a search, a lookup) off the UI thread."""
+
+    ok = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self.fn = fn
+
+    def run(self) -> None:
+        try:
+            self.ok.emit(self.fn())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class Store(QObject):
     changed = pyqtSignal()          # data in the open file changed (or another file was opened)
     view_changed = pyqtSignal()     # display currency / rates changed
     rates_status = pyqtSignal(bool, str)  # (success, message) after a fetch
+    market_status = pyqtSignal(bool, str, bool)  # (all prices arrived, message, quiet) after a refresh
 
     def __init__(self, cfg: AppConfig, cfg_path: Path):
         super().__init__()
@@ -47,6 +82,8 @@ class Store(QObject):
         self.last_saved: datetime | None = None
         self._state: engine.State | None = None
         self._worker: RateWorker | None = None
+        self._market_worker: MarketWorker | None = None
+        self._market_started: datetime | None = None
         self.data_dir = Path(cfg.data_dir) if cfg.data_dir else paths.default_data_dir()
 
     # ---- config ------------------------------------------------------------------------------
@@ -109,6 +146,80 @@ class Store(QObject):
     def wait_for_rates(self, ms: int = 3000) -> None:
         if self._worker is not None:
             self._worker.wait(ms)
+        if self._market_worker is not None:
+            self._market_worker.wait(ms)
+
+    # ---- market prices (I2) ------------------------------------------------------------------
+    def market_request(self) -> market.MarketRequest:
+        req = market.MarketRequest(coingecko_key=self.cfg.coingecko_key.strip())
+        extra: set[str] = set()
+        for h in self.state().holdings:
+            ref = invest.quote_ref(h)
+            if ref is None:
+                continue
+            source, symbol = ref
+            if source == "yahoo":
+                quote_cur = "USD" if h.kind == "metal" else (h.quote_currency or h.currency)
+                req.yahoo[symbol] = quote_cur
+                code, _div = market.normalize_currency(quote_cur)
+                if code and code not in CURRENCIES:
+                    extra.add(code)
+            elif source == "coingecko":
+                req.coingecko.setdefault(h.currency.lower(), set()).add(h.symbol)
+            elif source == "bitflyer":
+                req.bitflyer.append(symbol)
+            if h.currency not in CURRENCIES:
+                extra.add(h.currency)
+        if not req.empty:
+            req.fx = [c for c in CURRENCIES if c != "USD"] + sorted(extra)
+        return req
+
+    @property
+    def market_busy(self) -> bool:
+        return self._market_worker is not None and self._market_worker.isRunning()
+
+    def refresh_market(self, force: bool = False, quiet: bool = True) -> bool:
+        """Fetch prices in the background. Returns False when nothing was started."""
+        if self.repo is None or self.market_busy:
+            return False
+        if not force and self._market_started is not None and \
+                (datetime.now() - self._market_started).total_seconds() < market.MIN_INTERVAL_MINUTES * 60:
+            return False
+        req = self.market_request()
+        if req.empty:
+            return False
+        self._market_started = datetime.now()
+        worker = MarketWorker(req, self)
+        worker.done.connect(lambda result: self._market_done(result, quiet))
+        self._market_worker = worker
+        worker.start()
+        return True
+
+    def _market_done(self, result: market.MarketResult, quiet: bool) -> None:
+        if self.repo is not None and result.prices:
+            try:
+                self.repo.save_prices(result.prices)
+            except Exception as exc:
+                log.warning("could not store prices: %s", exc)
+        if result.fx:
+            self.cfg.rates = {**self.cfg.rates, **result.fx, "USD": 1.0}
+            self.cfg.rates_updated_at = datetime.now().replace(microsecond=0).isoformat()
+            self.cfg.rates_source = "yahoo"
+            self.save_config()
+        elif self.cfg.auto_update_rates and rates.due_for_update(self.rates_updated_at()):
+            self.fetch_rates(quiet=True)
+        log.info("market refresh: %d prices, fx %s, missing %s, errors %s", len(result.prices), sorted(result.fx),
+                 result.missing, result.errors)
+        ok = not result.errors and not result.missing
+        message = "\n".join(result.errors + ([", ".join(sorted(set(result.missing)))] if result.missing else []))
+        self._touch(saved=False)
+        if not quiet or not ok:
+            self.market_status.emit(ok, message, quiet)
+
+    def prices_fetched_at(self) -> datetime | None:
+        stamps = [invest.parse_time(p.fetched_at) for p in self.state().prices.values()]
+        stamps = [s for s in stamps if s is not None]
+        return max(stamps) if stamps else None
 
     # ---- data folder ---------------------------------------------------------------------------------
     def ensure_data_dir(self) -> bool:
@@ -185,11 +296,16 @@ class Store(QObject):
         self.save_config()
 
     def open_db(self, path: Path) -> db.MigrationReport:
-        """Open a CLEAR file (legacy files must go through import_legacy)."""
+        """Open a CLEAR file (legacy files must go through import_legacy).
+
+        A file written by an earlier CLEAR is backed up first, then brought to the
+        current layout (the backup opens with that earlier version if needed)."""
         path = Path(path)
         kind = db.classify(path)
         if kind == "legacy":
             raise LegacyFileError(str(path))
+        if kind == "older":
+            backup.make_backup(path, self.backups_root, "upgrade")
         repo, report = Repository.open(path, self.today())
         self.repo = repo
         self._remember(path)
@@ -322,10 +438,139 @@ class Store(QObject):
         self._need().record_bill_payment(bill_id, self.state().current, paid_date, amount, interest, note)
         self._touch()
 
-    def record_living_payment(self, lc: LivingCost, paid_date: date | None = None) -> None:
+    def record_living_payment(self, lc: LivingCost, paid_date: date | None = None,
+                              amount: float | None = None) -> None:
         cur = self.state().current
-        self._need().record_living_payment(lc.id, cur, paid_date or self.today(), lc.amount, lc.currency)
+        self._need().record_living_payment(lc.id, cur, paid_date or self.today(),
+                                           lc.amount if amount is None else amount, lc.currency)
         self._touch()
+
+    def update_bill_with_payment(self, bill: Bill, old_balance: float, paid_date: date, amount: float,
+                                 note: str = "") -> None:
+        """Save an edited debt whose balance went down as a payment of `amount` (B2).
+
+        The interest part is what the payment covers beyond the drop in balance, so the
+        balance ends exactly where the user put it and nothing is subtracted twice."""
+        repo = self._need()
+        new_balance = bill.amount
+        drop = max(0.0, old_balance - new_balance)
+        bill.amount = old_balance
+        repo.update_bill(bill)
+        repo.record_bill_payment(bill.id, self.state().current, paid_date, amount, max(0.0, amount - drop),
+                                 note or "balance edit")
+        self._touch()
+
+    def pending_debits(self) -> list[engine.DueItem]:
+        if self.repo is None:
+            return []
+        return engine.pending_debits(self.state(), self.rates, self.currency)
+
+    def record_debits(self, rows: list[tuple[engine.DueItem, float]]) -> int:
+        """Record automatic debits on their (business-day) dates. rows: (item, amount)."""
+        repo = self._need()
+        st = self.state()
+        living = {lc.id: lc for lc in st.living}
+        n = 0
+        for it, amount in rows:
+            if amount <= 0:
+                continue
+            if it.kind == "bill":
+                repo.record_bill_payment(it.target_id, st.current, it.due, amount, None, "auto debit")
+            elif it.kind == "living" and it.target_id in living:
+                lc = living[it.target_id]
+                repo.record_living_payment(lc.id, st.current, it.due, amount, lc.currency, "auto debit")
+            else:
+                continue
+            n += 1
+        self._touch()
+        return n
+
+    def set_fee_paid(self, card_id: int, paid: bool) -> None:
+        self._need().set_fee_paid(card_id, self.state().current if paid else None)
+        self._touch()
+
+    # ---- investments ------------------------------------------------------------------------------------
+    def add_holding(self, h: Holding) -> Holding:
+        h = self._need().add_holding(h)
+        self._touch()
+        return h
+
+    def update_holding(self, h: Holding) -> None:
+        self._need().update_holding(h)
+        self._touch()
+
+    def delete_holding(self, holding_id: int) -> None:
+        self._need().delete_holding(holding_id)
+        self._touch()
+
+    def reorder_holdings(self, ids: list[int]) -> None:
+        self._need().reorder_holdings(ids)
+        self._touch()
+
+    def record_trade(self, holding_id: int, kind: str, trade_date: date, **kw) -> None:
+        self._need().record_trade(holding_id, kind, trade_date, **kw)
+        self._touch()
+
+    def undo_last_trade(self, holding_id: int) -> bool:
+        done = self._need().undo_last_trade(holding_id) is not None
+        self._touch()
+        return done
+
+    def contribution_buy(self, h: Holding, trade_date: date) -> ContribBuy:
+        """What a contribution buys at the latest price (quantity 0 when there is no price yet)."""
+        st = self.state()
+        amount = invest.contribution_in_holding_currency(h, self.rates)
+        hv = invest.value_holding(h, st.prices, self.rates, h.currency)
+        qty = 0.0
+        price = 0.0
+        if h.kind != "manual" and hv.unit_price:
+            price = hv.unit_price
+            qty = invest.round_qty(h.kind, amount / price)
+        return ContribBuy(h.id, amount, qty, price, trade_date, h.contrib_method == "bank")
+
+    def record_contribution(self, h: Holding, trade_date: date | None = None) -> ContribBuy | None:
+        """Record this month's contribution at the latest price. None (nothing recorded) when a priced
+        holding has no price yet, since the quantity bought cannot be worked out."""
+        buy = self.contribution_buy(h, trade_date or self.today())
+        if h.kind != "manual" and buy.quantity <= 0:
+            return None
+        self._need().record_trade(h.id, "buy", buy.trade_date, quantity=buy.quantity, price=buy.price,
+                                  amount=buy.amount, is_contrib=True, cash_effect=buy.cash_effect,
+                                  note="contribution")
+        self._touch()
+        return buy
+
+    def undo_contribution(self, holding_id: int) -> bool:
+        done = self._need().undo_last_trade(holding_id, self.state().current) is not None
+        self._touch()
+        return done
+
+    def returns(self) -> dict[str, float]:
+        return self.state().returns
+
+    def save_returns(self, values: dict[str, float]) -> None:
+        self._need().save_returns(values)
+        self._touch()
+
+    def net_worth_history(self) -> list[NetWorthPoint]:
+        return self.repo.net_worth_history() if self.repo else []
+
+    def _record_net_worth(self, period: Period) -> None:
+        """P1: keep the net worth at the end of a closed month (approximately: today's prices)."""
+        st = self.state()
+        target, rts = self.currency, self.rates
+        prof = st.profile
+        savings = convert(prof.cumulative_savings, prof.cumulative_savings_currency, target, rts)
+        debts = sum(convert(b.amount, b.currency, target, rts) for b in st.bills if b.amount > 0)
+        debts += sum(convert(c.used_amount, c.currency, target, rts) for c in st.cards
+                     if not c.managed_in_bills and c.used_amount > 0)
+        value = invest.summarize(st.holdings, st.prices, rts, target).value
+        projected = None
+        if period.add(1) == st.current:
+            rows = engine.simulate(st, 1, rts, target)
+            projected = rows[0].net_worth if rows else None
+        self._need().save_net_worth(NetWorthPoint(str(period), target, savings, value, debts,
+                                                  savings + value - debts, projected, rates=dict(rts)))
 
     def undo_payment(self, target_type: str, target_id: int) -> bool:
         done = self._need().undo_last_payment(target_type, target_id, self.state().current)
@@ -341,6 +586,11 @@ class Store(QObject):
         snap = backup.make_backup(repo.path, self.backups_root, "close")
         summary = repo.close_month(plan, snap.name)
         log.info("closed %s: %s", plan.period, summary)
+        self._state = None
+        try:
+            self._record_net_worth(plan.period)
+        except Exception as exc:  # the close itself is done; the history is a bonus
+            log.warning("net worth not recorded: %s", exc)
         self._touch()
         return summary
 

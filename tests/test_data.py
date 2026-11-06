@@ -1,16 +1,18 @@
+import json
 import sqlite3
 from datetime import date, datetime
 
 import pytest
 
 from clear import backup, db
+from clear.info import SCHEMA_VERSION
 from clear.config import AppConfig, load_config, save_config
 from clear.models import Bill, LivingCost
 from clear.paths import default_data_dir, find_legacy_databases, find_root, unique_path
 from clear.periods import Period
 from clear.repo import ClosePlan, Repository
 
-from conftest import TODAY, make_legacy_36, make_legacy_minimal, make_legacy_old
+from conftest import TODAY, make_legacy_36, make_legacy_minimal, make_legacy_old, make_v40
 
 NOV = Period(2026, 11)
 
@@ -39,7 +41,7 @@ def test_migrate_36_file(tmp_path):
     assert report.legacy and report.migrated
     assert report.open_period == "2026-08" and report.last_closed == "2026-07"
     assert report.converted_bill_payments == 1 and report.converted_living_payments == 1
-    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == 1
+    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
     bills = {b.bill_name: b for b in repo.bills()}
     # the paid tick of August became a payment with interest: 500,000 -> 486,250
@@ -89,6 +91,26 @@ def test_migrate_is_idempotent(tmp_path):
     assert [b.amount for b in Repository(path).bills()] == before
 
 
+def test_upgrade_from_40(tmp_path):
+    path = make_v40(tmp_path / "v40.db")
+    assert db.classify(path) == "older"
+    repo, report = Repository.open(path, TODAY)
+    assert report.migrated and report.from_version == 1 and not report.legacy
+    assert {"create holdings", "create trades", "add bills.auto_debit", "add credit_cards.fee_month"} \
+        <= set(report.changes)
+    assert db.classify(path) == "current"
+    # loans are taken from the bank; money borrowed from people is paid by hand
+    assert {b.bill_name: b.auto_debit for b in repo.bills()} == {"Loan A": True, "Family": False}
+    # 4.0's "fee paid" becomes "paid this year"; a free card stays free
+    cards = {c.name: c for c in repo.cards()}
+    assert cards["Gold"].fee_paid_period == "2026" and cards["Basic"].fee_paid_period == ""
+    assert cards["Free"].fee_paid_period == ""
+    assert repo.last_closed() == Period(2026, 10)
+    assert repo.holdings() == [] and repo.net_worth_history() == []
+    _repo, again = Repository.open(path, TODAY)
+    assert not again.migrated
+
+
 def test_newer_schema_is_refused(tmp_path):
     path = tmp_path / "future.db"
     Repository.create(path, TODAY)
@@ -134,6 +156,17 @@ def test_payment_record_and_undo_restore_balance(tmp_path):
     assert repo.undo_last_payment("bill", bill.id, NOV)
     assert repo.bills()[0].amount == 500000
     assert not repo.undo_last_payment("bill", bill.id, NOV)
+
+
+def test_payment_with_given_interest_ends_at_the_edited_balance(tmp_path):
+    """B2: a balance edited by hand after a debit is saved as that payment, not subtracted twice."""
+    repo = new_repo(tmp_path)
+    bill = repo.add_bill(Bill(bill_name="L", amount=650000, interest_rate=14, monthly_payment=25000,
+                              monthly_due_day=2))
+    p = repo.record_bill_payment(bill.id, NOV, date(2026, 11, 2), 25000, 25000 - 17417)
+    assert (p.interest, p.principal, p.balance_after) == (7583, 17417, 632583)
+    assert repo.bills()[0].amount == 632583
+    assert repo.undo_last_payment("bill", bill.id, NOV) and repo.bills()[0].amount == 650000
 
 
 def test_overpayment_clamps_and_undoes_exactly(tmp_path):
@@ -205,6 +238,25 @@ def test_config_roundtrip_and_broken(tmp_path):
     assert again.language == "en" and again.display_currency == "CNY"
     path.write_text("{not json", encoding="utf-8")
     assert load_config(path) == AppConfig() or load_config(path).language == "ja"
+
+
+def test_config_from_40_moves_saved_columns(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({
+        "language": "ja",
+        "hidden_columns": {"bills": [13], "cards": [11, 14], "living": [8, 9], "plan": [5]},
+        "column_widths": {"cards": [110, 150, 60, 100, 100, 100, 60, 84, 126, 126, 90, 90, 56, 112, 96],
+                          "plan": [150, 101, 102, 103, 104, 105, 106, 107]}}), encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.columns_version == 2
+    assert cfg.hidden("cards") == {13}             # fee status merged into the fee column; "updated" 14 -> 13
+    assert cfg.hidden("plan") == {6}               # savings 5 -> 6 (contributions and investments added)
+    assert cfg.hidden("invest") == {11, 12, 13} and cfg.hidden("bills") == {13}
+    cards, plan = cfg.column_widths["cards"], cfg.column_widths["plan"]
+    assert len(cards) == 14 and cards[10] == 210 and cards[11:] == [56, 112, 96]
+    assert plan == [150, 101, 102, 103, 0, 104, 105, 0, 106, 107]
+    save_config(cfg, path)
+    assert load_config(path).hidden("cards") == {13}  # moved once only
 
 
 def test_paths(tmp_path):

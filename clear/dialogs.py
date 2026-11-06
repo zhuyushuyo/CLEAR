@@ -5,20 +5,36 @@ from __future__ import annotations
 from datetime import date
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-                             QListWidget, QListWidgetItem, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout,
+                             QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QTableWidget,
+                             QVBoxLayout, QWidget)
 
 from . import engine
 from .config import DEFAULT_HIDDEN
-from .i18n import (bill_type_label, category_from_label, category_label, fmt_date, fmt_period, method_label,
-                   money, t)
+from .i18n import (bill_type_label, category_from_label, category_label, fmt_date, fmt_md, fmt_period,
+                   method_label, money, month_name, t)
 from .models import (BILL_TYPES, CATEGORY_KEYS, LUMP_SUM_TYPES, NO_INTEREST_TYPES, PAYMENT_METHODS,
                      PLAN_OPTIONAL_TYPES, Bill, CreditCard, LivingCost)
 from .money import round_money
 from .periods import Period
-from .widgets import (CurrencyCombo, DateField, DayCombo, MoneySpin, button, label, repolish)
+from .widgets import (RIGHT, CurrencyCombo, DateField, DayCombo, MoneySpin, button, check_item, item, label,
+                      repolish)
 
 DELETE = 2  # QDialog result code for "delete"
+
+
+class PreviewLabel(QLabel):
+    """The hint line at the foot of a form: hidden while it has nothing to say."""
+
+    def __init__(self):
+        super().__init__("")
+        self.setObjectName("Hint")
+        self.setWordWrap(True)
+        self.hide()
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt naming
+        super().setText(text)
+        self.setVisible(bool(text))
 
 
 class FormDialog(QDialog):
@@ -37,7 +53,7 @@ class FormDialog(QDialog):
         self.form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         outer.addLayout(self.form)
-        self.preview = label("", "Hint", wrap=True)
+        self.preview = PreviewLabel()
         outer.addWidget(self.preview)
         self.error = label("", "Error", wrap=True)
         self.error.hide()
@@ -63,7 +79,7 @@ class FormDialog(QDialog):
                 box.addLayout(widget)
             box.addWidget(label(hint, "Hint", wrap=True))
             field = box
-        self.form.addRow(text, field)
+        self.form.addRow(text.replace("&", "&&"), field)  # the row label gets a buddy: "&" would be a mnemonic
         if isinstance(widget, QWidget):
             self._fields[id(widget)] = field
         return field
@@ -71,9 +87,33 @@ class FormDialog(QDialog):
     def set_row_visible(self, widget: QWidget, visible: bool) -> None:
         self.form.setRowVisible(self._fields.get(id(widget), widget), visible)
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.fit_height()
+
+    def fit_height(self) -> None:
+        """Make room for wrapped text that would be cut off. Qt's minimum size counts a wrapped label as one
+        line, and a new window is capped at two thirds of the screen height, so a long hint could lose its
+        last line on a small screen. Each such label gets the height it needs as its minimum."""
+        lay = self.layout()
+        if lay is None:
+            return
+        for _ in range(3):
+            lay.activate()
+            cut = [(lbl, lbl.heightForWidth(lbl.width())) for lbl in self.findChildren(QLabel)
+                   if lbl.isVisible() and lbl.wordWrap() and lbl.text()]
+            cut = [(lbl, need) for lbl, need in cut if need > lbl.height()]
+            if not cut:
+                return
+            for lbl, need in cut:
+                lbl.setMinimumHeight(need)
+            lay.activate()
+            self.resize(self.width(), max(self.height(), lay.totalMinimumSize().height()))
+
     def fail(self, message: str, widget: QWidget | None = None) -> None:
         self.error.setText(message)
         self.error.show()
+        self.fit_height()
         if widget is not None:
             widget.setProperty("invalid", True)
             repolish(widget)
@@ -129,6 +169,8 @@ class BillDialog(FormDialog):
         self.one_off.setValue(b.current_month_payment if b.cmp_period == str(current) else 0)
         self.due = DayCombo()
         self.due.setValue(b.monthly_due_day)
+        self.auto_debit = QCheckBox(t("bill.f.auto_debit"))
+        self.auto_debit.setChecked(b.auto_debit if bill else b.bill_type not in PLAN_OPTIONAL_TYPES)
         self.created = DateField(b.created_date or date.today())
 
         self.row(t("bill.f.name"), self.name)
@@ -140,6 +182,7 @@ class BillDialog(FormDialog):
         self.row(t("bill.f.monthly"), self.monthly)
         self.row(t("bill.f.this_month") + f"\n({fmt_period(current)})", self.one_off, t("bill.f.this_month_hint"))
         self.row(t("bill.f.due_day"), self.due)
+        self.row("", self.auto_debit, t("bill.f.auto_debit_hint"))
         self.row(t("bill.f.created"), self.created)
         self.type_hint = label("", "Hint", wrap=True)
         self.form.addRow("", self.type_hint)
@@ -162,6 +205,8 @@ class BillDialog(FormDialog):
 
     def _sync(self) -> None:
         code = self._code()
+        if self.src is None:  # a new debt: money from people is usually paid by hand
+            self.auto_debit.setChecked(code not in PLAN_OPTIONAL_TYPES)
         lump = code in LUMP_SUM_TYPES
         self.set_row_visible(self.rate, code not in NO_INTEREST_TYPES)
         self.set_row_visible(self.monthly, not lump)
@@ -189,6 +234,7 @@ class BillDialog(FormDialog):
         elif b.cmp_period == str(self.current):
             b.current_month_payment, b.cmp_period = 0.0, ""
         b.monthly_due_day = self.due.value()
+        b.auto_debit = self.auto_debit.isChecked()
         b.created_date = self.created.value()
         return b
 
@@ -286,9 +332,11 @@ class LivingDialog(FormDialog):
 
 # ---------------------------------------------------------------------------------------------------
 class CardDialog(FormDialog):
-    def __init__(self, parent: QWidget | None, card: CreditCard | None, default_currency: str):
+    def __init__(self, parent: QWidget | None, card: CreditCard | None, default_currency: str,
+                 today: date | None = None):
         super().__init__(t("card.title_edit" if card else "card.title_add"), parent, deletable=card is not None)
         self.src = card
+        self.today = today or date.today()
         c = card or CreditCard(currency=default_currency, created_date=date.today())
         self.issuer = QLineEdit(c.issuer)
         self.issuer.setPlaceholderText(t("card.f.issuer_ph"))
@@ -311,8 +359,15 @@ class CardDialog(FormDialog):
         self.auto.setChecked(card is None or abs(parts - c.used_amount) < 0.005)
         self.fee = MoneySpin(c.currency)
         self.fee.setValue(c.annual_fee)
+        self.fee_month = QComboBox()
+        self.fee_month.addItem(t("card.f.fee_month_none"), 0)
+        for m in range(1, 13):
+            self.fee_month.addItem(month_name(m), m)
+        self.fee_month.setCurrentIndex(max(0, self.fee_month.findData(c.fee_month or 0)))
+        self.fee_month.setMaximumWidth(140)
         self.fee_paid = QCheckBox(t("card.f.fee_paid"))
-        self.fee_paid.setChecked(c.paid_annual_fee)
+        self._was_paid = engine.fee_status(c, self.today).state == "paid" if card else False
+        self.fee_paid.setChecked(self._was_paid)
         self.managed = QCheckBox(t("card.f.managed"))
         self.managed.setChecked(c.managed_in_bills)
         used_box = QVBoxLayout()
@@ -328,13 +383,14 @@ class CardDialog(FormDialog):
         self.row(t("card.f.cash_rev"), self.cash)
         self.row(t("card.f.used"), used_box)
         self.row(t("card.f.fee"), self.fee)
-        self.row("", self.fee_paid)
-        self.row("", self.managed)
+        self.row(t("card.f.fee_month"), self.fee_month)
+        self.row("", self.fee_paid, t("card.f.fee_hint"))
+        self.row("", self.managed, t("card.f.managed_hint"))
         for w in (self.lump, self.shop, self.cash):
             w.valueChanged.connect(self._sum)
         self.auto.toggled.connect(self._sum)
-        self.fee.valueChanged.connect(lambda v: self.fee_paid.setEnabled(v > 0))
-        self.fee_paid.setEnabled(c.annual_fee > 0)
+        self.fee.valueChanged.connect(self._fee_changed)
+        self._fee_changed(c.annual_fee)
         self.currency.currentTextChanged.connect(self._currency_changed)
         self._sum()
         self.name.setFocus()
@@ -342,6 +398,10 @@ class CardDialog(FormDialog):
     def _currency_changed(self, cur: str) -> None:
         for w in (self.limit, self.lump, self.shop, self.cash, self.used, self.fee):
             w.set_currency(cur)
+
+    def _fee_changed(self, value: float) -> None:
+        self.fee_paid.setEnabled(value > 0)
+        self.fee_month.setEnabled(value > 0)
 
     def _sum(self) -> None:
         self.used.setEnabled(not self.auto.isChecked())
@@ -360,7 +420,16 @@ class CardDialog(FormDialog):
         c.cash_revolving_amount = self.cash.value()
         c.used_amount = self.used.value()
         c.annual_fee = self.fee.value()
-        c.paid_annual_fee = self.fee_paid.isChecked() and c.annual_fee > 0
+        c.fee_month = int(self.fee_month.currentData() or 0)
+        paid = self.fee_paid.isChecked() and c.annual_fee > 0
+        if not paid:
+            c.fee_paid_period = ""
+        elif not (self._was_paid and engine.fee_status(c, self.today).state == "paid"):
+            c.fee_paid_period = str(Period.from_date(self.today))
+        elif c.fee_month and Period.try_parse(c.fee_paid_period or "") is None:
+            # 4.0 only knew "paid this year": now that the billing month is known, it means this cycle
+            c.fee_paid_period = str(engine.fee_cycle(c.fee_month, self.today))
+        c.paid_annual_fee = paid
         c.managed_in_bills = self.managed.isChecked()
         c.last_updated = date.today()
         return c
@@ -378,13 +447,20 @@ class PaymentDialog(FormDialog):
     """Record a payment for a debt: amount, interest part, and the balance afterwards."""
 
     def __init__(self, parent: QWidget | None, bill: Bill, current: Period, today: date,
-                 interest_already_charged: bool):
+                 interest_already_charged: bool, new_balance: float | None = None):
         super().__init__(t("pay.title", name=bill.label), parent, ok_text=t("pay.ok"))
         self.bill = bill
+        self.new_balance = new_balance
+        self.drop = max(0.0, bill.amount - new_balance) if new_balance is not None else 0.0
         cur = bill.currency
         planned = engine.planned_amount(bill, current)
-        self.form.addRow(label(t("pay.info", balance=money(bill.amount, cur), rate=f"{bill.interest_rate:g}",
-                                 planned=money(planned, cur)), "Muted", wrap=True))
+        if new_balance is not None:
+            info = t("pay.from_balance", old=money(bill.amount, cur), new=money(new_balance, cur),
+                     drop=money(self.drop, cur))
+        else:
+            info = t("pay.info", balance=money(bill.amount, cur), rate=f"{bill.interest_rate:g}",
+                     planned=money(planned, cur))
+        self.form.addRow(label(info, "Muted", wrap=True))
         self.paid_on = DateField(today)
         self.amount = MoneySpin(cur)
         self.amount.setValue(planned if planned > 0 else bill.amount)
@@ -396,6 +472,10 @@ class PaymentDialog(FormDialog):
         self.row(t("pay.f.interest"), self.interest,
                  t("pay.interest_once") if interest_already_charged and bill.has_interest else "")
         self.set_row_visible(self.interest, bill.has_interest)
+        if new_balance is not None:  # the interest is what the payment covers beyond the drop
+            self.interest.setEnabled(False)
+            self.set_row_visible(self.interest, True)
+            self.amount.setValue(max(planned, self.drop))
         self.row(t("pay.f.note"), self.note)
         self.amount.valueChanged.connect(self._update)
         self.interest.valueChanged.connect(self._update)
@@ -404,6 +484,10 @@ class PaymentDialog(FormDialog):
         self.amount.selectAll()
 
     def _update(self) -> None:
+        if self.new_balance is not None:
+            self.interest.blockSignals(True)
+            self.interest.setValue(max(0.0, self.amount.value() - self.drop))
+            self.interest.blockSignals(False)
         split = engine.split_payment(self.bill, self.bill.amount, self.amount.value(), self.interest.value())
         cur = self.bill.currency
         text = t("pay.preview", principal=money(split.principal, cur), after=money(split.balance_after, cur))
@@ -416,8 +500,15 @@ class PaymentDialog(FormDialog):
         repolish(self.preview)
 
     def values(self) -> tuple[date, float, float | None, str]:
-        interest = self.interest.value() if self.bill.has_interest else 0.0
+        interest = self.interest.value() if (self.bill.has_interest or self.new_balance is not None) else 0.0
         return self.paid_on.value(), self.amount.value(), interest, self.note.text().strip()
+
+    def validate(self) -> bool:
+        self.clear_errors(self.amount)
+        if self.new_balance is not None and self.amount.value() + 1e-9 < self.drop:
+            self.fail(t("pay.err.below_drop", drop=money(self.drop, self.bill.currency)), self.amount)
+            return False
+        return True
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -428,20 +519,24 @@ TABLE_COLUMNS = {
               "debts.col.created"),
     "cards": ("cards.col.issuer", "cards.col.name", "cards.col.due_day", "cards.col.limit", "cards.col.used",
               "cards.col.available", "cards.col.util", "cards.col.lump", "cards.col.shop_rev", "cards.col.cash_rev",
-              "cards.col.fee", "cards.col.fee_paid", "cards.col.currency", "cards.col.managed", "cards.col.updated"),
+              "cards.col.fee", "cards.col.currency", "cards.col.managed", "cards.col.updated"),
     "living": ("living.col.category", "living.col.name", "living.col.detail", "living.col.amount",
                "living.col.currency", "living.col.method", "living.col.due_day", "living.col.paid",
                "living.col.created", "living.col.updated"),
-    "plan": ("plan.col.month", "plan.col.income", "plan.col.debt", "plan.col.living", "plan.col.net",
-             "plan.col.savings", "plan.col.balance", "plan.col.worth"),
+    "plan": ("plan.col.month", "plan.col.income", "plan.col.debt", "plan.col.living", "plan.col.contrib",
+             "plan.col.net", "plan.col.savings", "plan.col.invest", "plan.col.balance", "plan.col.worth"),
+    "invest": ("invest.col.name", "invest.col.kind", "invest.col.account", "invest.col.qty", "invest.col.cost",
+               "invest.col.price", "invest.col.value", "invest.col.gain", "invest.col.gain_pct", "invest.col.day",
+               "invest.col.contrib", "invest.col.currency", "invest.col.source", "invest.col.updated"),
 }
 DEFAULT_WIDTHS = {
     "bills": [156, 136, 112, 70, 104, 54, 58, 92, 98, 132, 82, 104, 92, 96],
-    "cards": [110, 150, 60, 100, 100, 100, 60, 84, 126, 126, 76, 96, 56, 112, 96],
+    "cards": [110, 150, 60, 100, 100, 100, 60, 84, 126, 126, 230, 56, 112, 96],
     "living": [140, 150, 170, 100, 56, 140, 132, 64, 96, 96],
     "plan": [],
+    "invest": [170, 112, 150, 84, 104, 104, 116, 104, 76, 96, 130, 56, 150, 120],
 }
-ALWAYS_VISIBLE = {"bills": {0}, "cards": {1}, "living": {1}, "plan": {0}}
+ALWAYS_VISIBLE = {"bills": {0}, "cards": {1}, "living": {1}, "plan": {0}, "invest": {0}}
 
 
 class ColumnsDialog(QDialog):
@@ -506,3 +601,64 @@ class ColumnsDialog(QDialog):
 
     def result_hidden(self) -> dict[str, list[int]]:
         return {k: sorted(v) for k, v in self.hidden.items()}
+
+
+# ---------------------------------------------------------------------------------------------------
+class DebitDialog(QDialog):
+    """B2: automatic debits past their date, recorded in one go after a quick check."""
+
+    def __init__(self, parent: QWidget | None, items: list[engine.DueItem]):
+        super().__init__(parent)
+        self.setWindowTitle(t("debit.title"))
+        self.setMinimumSize(640, 360)
+        self.items = items
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 20, 22, 18)
+        lay.setSpacing(12)
+        lay.addWidget(label(t("debit.title"), "DialogTitle"))
+        lay.addWidget(label(t("debit.intro"), "Hint", wrap=True))
+        headers = ["", t("home.month.col.date"), t("home.month.col.item"), t("home.month.col.kind"),
+                   t("home.month.col.amount")]
+        tbl = QTableWidget(len(items), len(headers))
+        tbl.setHorizontalHeaderLabels(headers)
+        tbl.verticalHeader().setVisible(False)
+        tbl.verticalHeader().setDefaultSectionSize(38)
+        tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tbl.setShowGrid(False)
+        tbl.setAlternatingRowColors(True)
+        head = tbl.horizontalHeader()
+        head.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        head.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        for col, w in ((0, 36), (1, 110), (3, 150), (4, 150)):
+            tbl.setColumnWidth(col, w)
+        tbl.horizontalHeaderItem(4).setTextAlignment(RIGHT)
+        self.spins: list[MoneySpin] = []
+        for r, it in enumerate(items):
+            tbl.setItem(r, 0, check_item(True, r))
+            tbl.setItem(r, 1, item(fmt_md(it.due), tone="text_muted"))
+            tbl.setItem(r, 2, item(it.name))
+            kind = bill_type_label(it.sub) if it.kind == "bill" else category_label(it.sub)
+            tbl.setItem(r, 3, item(kind, tone="text_muted"))
+            spin = MoneySpin(it.currency)
+            spin.setValue(it.amount)
+            spin.setMinimumWidth(120)
+            self.spins.append(spin)
+            tbl.setCellWidget(r, 4, spin)
+        self.table = tbl
+        lay.addWidget(tbl, 1)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(button(t("debit.later"), slot=self.reject))
+        ok = button(t("debit.record"), "primary", "fa5s.check", self.accept)
+        ok.setDefault(True)
+        row.addWidget(ok)
+        lay.addLayout(row)
+
+    def chosen(self) -> list[tuple[engine.DueItem, float]]:
+        out = []
+        for r, it in enumerate(self.items):
+            cell = self.table.item(r, 0)
+            if cell is not None and cell.checkState() == Qt.CheckState.Checked:
+                out.append((it, self.spins[r].value()))
+        return out

@@ -5,8 +5,9 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QGridLayout, QHBoxLayout, QLineEdit, QVBoxLayout
 
+from . import engine
 from .dialogs import DEFAULT_WIDTHS, TABLE_COLUMNS
-from .i18n import category_label, due_text, fmt_date, method_label, money, t
+from .i18n import category_label, due_text, fmt_date, fmt_md, method_label, money, t
 from .money import convert, fmt_number
 from .shell import Page
 from .widgets import (CENTER, RIGHT, Card, CurrencyCombo, DataTable, DayCombo, MoneySpin, button, check_item,
@@ -19,7 +20,6 @@ class MonthlyPage(Page):
     key = "monthly"
     title_key = "nav.monthly"
     icon_name = "fa5s.calendar-check"
-    scrollable = False
 
     def __init__(self, store, window):
         super().__init__(store, window)
@@ -86,6 +86,7 @@ class MonthlyPage(Page):
         lc_card.actions.addWidget(button(t("common.edit"), None, "fa5s.pen", self._edit))
         lc_card.actions.addWidget(button(t("common.delete"), "danger", "fa5s.trash-alt", self._delete))
         self.table = DataTable("living", [t(k) for k in TABLE_COLUMNS["living"]])
+        self.table.setMinimumHeight(230)
         self.table.right_align((3,))
         self.table.itemDoubleClicked.connect(lambda it: self._edit() if it.column() != PAID_COL else None)
         self.table.itemChanged.connect(self._ticked)
@@ -134,7 +135,8 @@ class MonthlyPage(Page):
                 else:
                     cash += v
                 paid = st.paid_living.get(lc.id)
-                due = st.current.day(lc.monthly_due_day)
+                due = engine.due_date(st.current, lc.monthly_due_day)
+                nominal = st.current.day(lc.monthly_due_day)
                 days = (due - st.today).days
                 tbl.setItem(r, 0, item(category_label(lc.category), data=lc.id, tone="text_muted"))
                 tbl.setItem(r, 1, item(lc.name, data=lc.id, bold=True))
@@ -144,9 +146,17 @@ class MonthlyPage(Page):
                 tbl.setItem(r, 5, item(method_label(lc.payment_method)))
                 if paid and paid.paid:
                     tbl.setItem(r, 6, item(t("due.cell_day", day=lc.monthly_due_day), tone="text_muted"))
+                elif days < 0 and lc.auto_debit:
+                    tbl.setItem(r, 6, item(t("due.cell_pending", day=lc.monthly_due_day), tone="warning",
+                                           tooltip=t("due.pending_tip")))
                 else:
                     tone = "critical" if days < 0 and not lc.is_card else "warning" if 0 <= days <= 3 else None
-                    tbl.setItem(r, 6, item(t("due.cell", day=lc.monthly_due_day, rel=due_text(days)), tone=tone))
+                    if due != nominal and not lc.is_card:
+                        text = t("due.cell_moved", day=lc.monthly_due_day, moved=fmt_md(due, weekday=False), rel=due_text(days))
+                        tip = t("due.moved_tip", nominal=fmt_md(nominal), due=fmt_md(due))
+                    else:
+                        text, tip = t("due.cell", day=lc.monthly_due_day, rel=due_text(days)), None
+                    tbl.setItem(r, 6, item(text, tone=tone, tooltip=tip))
                 tbl.setItem(r, PAID_COL, check_item(bool(paid and paid.paid), r, enabled=self.store.has_db))
                 tbl.setItem(r, 8, item(fmt_date(lc.created_date), tone="text_muted"))
                 tbl.setItem(r, 9, item(fmt_date(lc.last_updated), tone="text_muted"))

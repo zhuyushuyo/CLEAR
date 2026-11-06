@@ -1,3 +1,5 @@
 PyQt6>=6.5
 qtawesome>=1.2
 requests>=2.28
+yfinance>=1.0
+jpholiday>=1.0

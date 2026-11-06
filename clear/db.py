@@ -2,7 +2,7 @@
 
 Files from Payback Management 3.x have ``PRAGMA user_version = 0`` and may lack
 columns that were added over time; ``migrate`` brings any of them to the current
-layout inside a single transaction. Connections are opened per operation and
+layout inside a single transaction (3.x -> 1 -> 2, one step after the other). Connections are opened per operation and
 closed right away, so Google Drive can sync the file while the app is idle.
 """
 
@@ -18,7 +18,9 @@ from pathlib import Path
 
 from . import engine
 from .info import APP_VERSION, SCHEMA_VERSION
-from .models import Bill, CreditCard, LivingCost, Payment, Profile
+from .models import (ACCOUNTS, CONTRIB_METHODS, HOLDING_KINDS, METAL_UNITS, PAYMENT_METHODS, PRICE_SOURCES,
+                     TRADE_KINDS, Bill, CreditCard, Holding, LivingCost, NetWorthPoint, Payment, Price, Profile,
+                     Trade)
 from .money import CURRENCIES, round_money, to_float
 from .periods import Period
 
@@ -34,7 +36,7 @@ SCHEMA: dict[str, list[tuple[str, str]]] = {
         ("monthly_payment", "REAL DEFAULT 0"), ("monthly_due_day", "INTEGER DEFAULT 27"),
         ("current_month_payment", "REAL DEFAULT 0"), ("paid_this_month", "INTEGER DEFAULT 0"),
         ("created_date", "TEXT"), ("sort_order", "INTEGER"),
-        ("cmp_period", "TEXT DEFAULT ''"), ("note", "TEXT DEFAULT ''"),
+        ("cmp_period", "TEXT DEFAULT ''"), ("note", "TEXT DEFAULT ''"), ("auto_debit", "INTEGER DEFAULT 1"),
     ],
     "living_costs": [
         ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
@@ -51,6 +53,7 @@ SCHEMA: dict[str, list[tuple[str, str]]] = {
         ("used_amount", "REAL DEFAULT 0"), ("shopping_revolving_amount", "REAL DEFAULT 0"),
         ("cash_revolving_amount", "REAL DEFAULT 0"), ("shopping_credit_amount", "REAL DEFAULT 0"),
         ("created_date", "TEXT"), ("last_updated", "TEXT"), ("managed_in_bills", "INTEGER DEFAULT 1"),
+        ("fee_month", "INTEGER DEFAULT 0"), ("fee_paid_period", "TEXT DEFAULT ''"),
     ],
     "savings": [("key", "TEXT PRIMARY KEY"), ("value", "TEXT")],
     "meta": [("key", "TEXT PRIMARY KEY"), ("value", "TEXT")],
@@ -65,10 +68,44 @@ SCHEMA: dict[str, list[tuple[str, str]]] = {
     "month_closes": [
         ("period", "TEXT PRIMARY KEY"), ("closed_at", "TEXT"), ("backup_file", "TEXT"), ("summary", "TEXT"),
     ],
+    # ---- 4.1: investments and net-worth history ----
+    "holdings": [
+        ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+        ("kind", "TEXT DEFAULT 'stock'"), ("symbol", "TEXT DEFAULT ''"), ("name", "TEXT DEFAULT ''"),
+        ("account", "TEXT DEFAULT 'taxable'"), ("quantity", "REAL DEFAULT 0"), ("unit", "TEXT DEFAULT ''"),
+        ("avg_cost", "REAL DEFAULT 0"), ("currency", "TEXT DEFAULT 'JPY'"), ("price_source", "TEXT DEFAULT 'yahoo'"),
+        ("quote_currency", "TEXT DEFAULT ''"), ("manual_price", "REAL DEFAULT 0"), ("adjust_pct", "REAL DEFAULT 0"),
+        ("contrib_amount", "REAL DEFAULT 0"), ("contrib_currency", "TEXT DEFAULT 'JPY'"),
+        ("contrib_day", "INTEGER DEFAULT 27"), ("contrib_method", "TEXT DEFAULT 'bank'"),
+        ("note", "TEXT DEFAULT ''"), ("sort_order", "INTEGER DEFAULT 0"), ("created_date", "TEXT"),
+        ("last_updated", "TEXT"),
+    ],
+    "trades": [
+        ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+        ("holding_id", "INTEGER NOT NULL"), ("trade_date", "TEXT"), ("kind", "TEXT DEFAULT 'buy'"),
+        ("quantity", "REAL DEFAULT 0"), ("price", "REAL DEFAULT 0"), ("fee", "REAL DEFAULT 0"),
+        ("amount", "REAL DEFAULT 0"), ("currency", "TEXT DEFAULT 'JPY'"),
+        ("qty_before", "REAL DEFAULT 0"), ("qty_after", "REAL DEFAULT 0"),
+        ("avg_before", "REAL DEFAULT 0"), ("avg_after", "REAL DEFAULT 0"), ("realized", "REAL DEFAULT 0"),
+        ("value_before", "REAL"), ("value_after", "REAL"), ("period", "TEXT DEFAULT ''"),
+        ("is_contrib", "INTEGER DEFAULT 0"), ("cash_effect", "INTEGER DEFAULT 1"),
+        ("account", "TEXT DEFAULT ''"), ("note", "TEXT DEFAULT ''"), ("created_at", "TEXT"),
+    ],
+    "prices": [
+        ("key", "TEXT PRIMARY KEY"), ("source", "TEXT"), ("symbol", "TEXT"), ("price", "REAL"),
+        ("prev_close", "REAL"), ("currency", "TEXT"), ("fetched_at", "TEXT"),
+    ],
+    "net_worth": [
+        ("period", "TEXT PRIMARY KEY"), ("recorded_at", "TEXT"), ("currency", "TEXT"), ("savings", "REAL"),
+        ("investments", "REAL"), ("debts", "REAL"), ("net_worth", "REAL"), ("projected_next", "REAL"),
+        ("rates", "TEXT"),
+    ],
 }
 INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_payments_period ON payments(period)",
     "CREATE INDEX IF NOT EXISTS idx_payments_target ON payments(target_type, target_id, period)",
+    "CREATE INDEX IF NOT EXISTS idx_trades_holding ON trades(holding_id, period)",
+    "CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(trade_date)",
 ]
 
 # Keys of the `savings` table (names kept from Payback Management 3.x).
@@ -128,7 +165,8 @@ def columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 
 def classify(path: str | Path) -> str:
-    """'new' (empty), 'legacy' (Payback Management 3.x), 'current', 'newer' or 'foreign'."""
+    """'new' (empty), 'legacy' (Payback Management 3.x), 'older' (an earlier CLEAR),
+    'current', 'newer' or 'foreign'."""
     conn = connect(path)
     try:
         try:
@@ -142,6 +180,8 @@ def classify(path: str | Path) -> str:
         return "newer"
     if version == SCHEMA_VERSION:
         return "current"
+    if version > 0:
+        return "older"
     if not (names - {"sqlite_sequence"}):
         return "new"
     if names & LEGACY_TABLES:
@@ -210,6 +250,20 @@ def _currency(value: object) -> str:
     return text if text in CURRENCIES else "JPY"
 
 
+def _choice(value: object, allowed, default: str) -> str:
+    text = str(value or "").strip()
+    return text if text in allowed else default
+
+
+def _float_or_none(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _get(row: sqlite3.Row, key: str, default: object = None) -> object:
     return row[key] if key in row.keys() else default
 
@@ -235,6 +289,7 @@ def row_to_bill(row: sqlite3.Row) -> Bill:
         created_date=parse_date(_get(row, "created_date")),
         sort_order=_int(_get(row, "sort_order"), row["id"] or 0),
         note=str(_get(row, "note") or ""),
+        auto_debit=bool(_int(_get(row, "auto_debit", 1), 1)),
     )
 
 
@@ -250,7 +305,7 @@ def row_to_living(row: sqlite3.Row) -> LivingCost:
         amount=round_money(_get(row, "amount", 0), cur),
         currency=cur,
         monthly_due_day=_day(_get(row, "monthly_due_day"), 1),
-        payment_method="Credit Card" if method == "Credit Card" else "Cash",
+        payment_method=method if method in PAYMENT_METHODS else "Cash",
         created_date=created,
         last_updated=parse_date(_get(row, "last_updated")) or created,
     )
@@ -275,6 +330,8 @@ def row_to_card(row: sqlite3.Row) -> CreditCard:
         created_date=parse_date(_get(row, "created_date")),
         last_updated=parse_date(_get(row, "last_updated")),
         managed_in_bills=True if managed is None else bool(_int(managed, 1)),
+        fee_month=max(0, min(12, _int(_get(row, "fee_month", 0), 0))),
+        fee_paid_period=str(_get(row, "fee_paid_period") or "").strip(),
     )
 
 
@@ -294,14 +351,14 @@ def row_to_payment(row: sqlite3.Row) -> Payment:
 
 BILL_COLUMNS = ("bill_type", "bill_name", "borrower_name", "lender_name", "amount", "currency",
                 "interest_rate", "monthly_payment", "monthly_due_day", "current_month_payment",
-                "cmp_period", "created_date", "sort_order", "note")
+                "cmp_period", "created_date", "sort_order", "note", "auto_debit")
 
 
 def bill_values(b: Bill) -> tuple:
     return (b.bill_type, b.bill_name, b.borrower_name, b.lender_name, round_money(b.amount, b.currency),
             b.currency, b.interest_rate, round_money(b.monthly_payment, b.currency), int(b.monthly_due_day),
             round_money(b.current_month_payment, b.currency), b.cmp_period or "",
-            date_text(b.created_date), int(b.sort_order or 0), b.note or "")
+            date_text(b.created_date), int(b.sort_order or 0), b.note or "", int(bool(b.auto_debit)))
 
 
 LIVING_COLUMNS = ("category", "name", "description", "amount", "currency", "monthly_due_day",
@@ -315,13 +372,163 @@ def living_values(lc: LivingCost) -> tuple:
 
 CARD_COLUMNS = ("issuer", "name", "due_day", "annual_fee", "paid_annual_fee", "credit_limit", "currency",
                 "used_amount", "shopping_credit_amount", "shopping_revolving_amount", "cash_revolving_amount",
-                "created_date", "last_updated", "managed_in_bills")
+                "created_date", "last_updated", "managed_in_bills", "fee_month", "fee_paid_period")
 
 
 def card_values(c: CreditCard) -> tuple:
-    return (c.issuer, c.name, int(c.due_day), c.annual_fee, int(c.paid_annual_fee), c.credit_limit, c.currency,
-            c.used_amount, c.shopping_credit_amount, c.shopping_revolving_amount, c.cash_revolving_amount,
-            date_text(c.created_date), date_text(c.last_updated), int(c.managed_in_bills))
+    return (c.issuer, c.name, int(c.due_day), c.annual_fee, int(bool(c.fee_paid_period)), c.credit_limit,
+            c.currency, c.used_amount, c.shopping_credit_amount, c.shopping_revolving_amount,
+            c.cash_revolving_amount, date_text(c.created_date), date_text(c.last_updated), int(c.managed_in_bills),
+            int(c.fee_month or 0), c.fee_paid_period or "")
+
+
+# ---- investments ------------------------------------------------------------------------------
+def row_to_holding(row: sqlite3.Row) -> Holding:
+    kind = _choice(_get(row, "kind"), HOLDING_KINDS, "manual")
+    cur = _currency(_get(row, "currency"))
+    source = _choice(_get(row, "price_source"), PRICE_SOURCES, "manual")
+    if kind == "manual":
+        source = "manual"
+    return Holding(
+        id=row["id"], kind=kind, symbol=str(_get(row, "symbol") or "").strip(),
+        name=str(_get(row, "name") or ""), account=_choice(_get(row, "account"), ACCOUNTS, "other"),
+        quantity=max(0.0, to_float(_get(row, "quantity", 0))),
+        unit=_choice(_get(row, "unit"), METAL_UNITS, "g") if kind == "metal" else "",
+        avg_cost=max(0.0, to_float(_get(row, "avg_cost", 0))), currency=cur, price_source=source,
+        quote_currency=str(_get(row, "quote_currency") or "").strip(),
+        manual_price=max(0.0, to_float(_get(row, "manual_price", 0))),
+        adjust_pct=to_float(_get(row, "adjust_pct", 0)),
+        contrib_amount=max(0.0, to_float(_get(row, "contrib_amount", 0))),
+        contrib_currency=_currency(_get(row, "contrib_currency")),
+        contrib_day=_day(_get(row, "contrib_day"), 27),
+        contrib_method=_choice(_get(row, "contrib_method"), CONTRIB_METHODS, "bank"),
+        note=str(_get(row, "note") or ""), sort_order=_int(_get(row, "sort_order"), row["id"] or 0),
+        created_date=parse_date(_get(row, "created_date")), last_updated=parse_date(_get(row, "last_updated")),
+    )
+
+
+HOLDING_COLUMNS = ("kind", "symbol", "name", "account", "quantity", "unit", "avg_cost", "currency", "price_source",
+                   "quote_currency", "manual_price", "adjust_pct", "contrib_amount", "contrib_currency",
+                   "contrib_day", "contrib_method", "note", "sort_order", "created_date", "last_updated")
+
+
+def holding_values(h: Holding) -> tuple:
+    return (h.kind, h.symbol.strip(), h.name, h.account, float(h.quantity), h.unit if h.kind == "metal" else "",
+            float(h.avg_cost), h.currency, "manual" if h.kind == "manual" else h.price_source, h.quote_currency,
+            float(h.manual_price), float(h.adjust_pct), round_money(h.contrib_amount, h.contrib_currency),
+            h.contrib_currency, int(h.contrib_day), h.contrib_method, h.note or "", int(h.sort_order or 0),
+            date_text(h.created_date), date_text(h.last_updated))
+
+
+def row_to_trade(row: sqlite3.Row) -> Trade:
+    return Trade(
+        id=row["id"], holding_id=int(row["holding_id"]), trade_date=parse_date(_get(row, "trade_date")),
+        kind=_choice(_get(row, "kind"), TRADE_KINDS, "buy"), quantity=to_float(_get(row, "quantity", 0)),
+        price=to_float(_get(row, "price", 0)), fee=to_float(_get(row, "fee", 0)),
+        amount=to_float(_get(row, "amount", 0)), currency=_currency(_get(row, "currency")),
+        qty_before=to_float(_get(row, "qty_before", 0)), qty_after=to_float(_get(row, "qty_after", 0)),
+        avg_before=to_float(_get(row, "avg_before", 0)), avg_after=to_float(_get(row, "avg_after", 0)),
+        realized=to_float(_get(row, "realized", 0)), value_before=_float_or_none(_get(row, "value_before")),
+        value_after=_float_or_none(_get(row, "value_after")), period=str(_get(row, "period") or ""),
+        is_contrib=bool(_int(_get(row, "is_contrib", 0), 0)), cash_effect=bool(_int(_get(row, "cash_effect", 1), 1)),
+        account=str(_get(row, "account") or ""), note=str(_get(row, "note") or ""),
+        created_at=str(_get(row, "created_at") or ""),
+    )
+
+
+TRADE_COLUMNS = ("holding_id", "trade_date", "kind", "quantity", "price", "fee", "amount", "currency", "qty_before",
+                 "qty_after", "avg_before", "avg_after", "realized", "value_before", "value_after", "period",
+                 "is_contrib", "cash_effect", "account", "note", "created_at")
+
+
+def trade_values(tr: Trade) -> tuple:
+    return (tr.holding_id, date_text(tr.trade_date), tr.kind, tr.quantity, tr.price, tr.fee, tr.amount, tr.currency,
+            tr.qty_before, tr.qty_after, tr.avg_before, tr.avg_after, tr.realized, tr.value_before, tr.value_after,
+            tr.period, int(tr.is_contrib), int(tr.cash_effect), tr.account, tr.note or "", tr.created_at or now_text())
+
+
+def fetch_holding(conn: sqlite3.Connection, holding_id: int) -> Holding:
+    row = conn.execute("SELECT * FROM holdings WHERE id=?", (holding_id,)).fetchone()
+    if row is None:
+        raise KeyError(f"holding {holding_id} not found")
+    return row_to_holding(row)
+
+
+def insert_trade(conn: sqlite3.Connection, holding_id: int, kind: str, trade_date: date, *, quantity: float = 0.0,
+                 price: float = 0.0, fee: float = 0.0, amount: float = 0.0, is_contrib: bool = False,
+                 cash_effect: bool = True, note: str = "") -> Trade:
+    """Record a trade and update the holding (quantity and moving-average cost)."""
+    from . import invest  # local import: invest imports models only
+
+    h = fetch_holding(conn, holding_id)
+    period = str(Period.from_date(trade_date))
+    tr = Trade(holding_id=holding_id, trade_date=trade_date, kind=kind, fee=max(0.0, fee), currency=h.currency,
+               period=period, is_contrib=is_contrib, cash_effect=cash_effect, account=h.account, note=note,
+               created_at=now_text())
+    if h.kind == "manual":
+        # A hand-valued asset: money added or taken out changes its value and its cost.
+        value, cost = h.manual_price, h.avg_cost
+        cash = max(0.0, amount)
+        new_value, new_cost, realized = value, cost, 0.0
+        if kind == "buy":
+            new_value, new_cost = value + cash, cost + cash
+        elif kind == "sell":
+            cash = min(cash, value)
+            removed = cost * (cash / value) if value > 0 else 0.0
+            new_value, new_cost, realized = value - cash, cost - removed, cash - removed
+        tr.quantity, tr.price, tr.amount, tr.realized = 1.0, 0.0, round_money(cash, h.currency), realized
+        tr.qty_before = tr.qty_after = 1.0
+        tr.avg_before, tr.avg_after = cost, new_cost
+        tr.value_before, tr.value_after = value, new_value
+        conn.execute("UPDATE holdings SET manual_price=?, avg_cost=?, quantity=1, last_updated=? WHERE id=?",
+                     (new_value, new_cost, date_text(trade_date), holding_id))
+    else:
+        if kind in ("buy", "sell") and quantity <= 0:
+            raise ValueError("a buy or sell needs a quantity")
+        res = invest.apply_trade(h.quantity, h.avg_cost, kind, quantity, price, fee, amount)
+        q = quantity if kind in ("buy", "sell") else 0.0
+        if kind == "sell":
+            q = min(quantity, h.quantity)
+        tr.quantity, tr.price = q, price
+        tr.amount = round_money(res.amount, h.currency)
+        tr.realized = res.realized
+        tr.qty_before, tr.qty_after = h.quantity, res.qty_after
+        tr.avg_before, tr.avg_after = h.avg_cost, res.avg_after
+        conn.execute("UPDATE holdings SET quantity=?, avg_cost=?, last_updated=? WHERE id=?",
+                     (res.qty_after, res.avg_after, date_text(trade_date), holding_id))
+    cur = conn.execute(f"INSERT INTO trades ({', '.join(TRADE_COLUMNS)}) VALUES "
+                       f"({', '.join('?' for _ in TRADE_COLUMNS)})", trade_values(tr))
+    tr.id = cur.lastrowid
+    return tr
+
+
+def undo_trade(conn: sqlite3.Connection, trade: Trade) -> None:
+    """Remove a trade and put the holding back as it was before it."""
+    h = fetch_holding(conn, trade.holding_id)
+    if h.kind == "manual" and trade.value_before is not None:
+        conn.execute("UPDATE holdings SET manual_price=?, avg_cost=? WHERE id=?",
+                     (trade.value_before, trade.avg_before, h.id))
+    elif trade.kind in ("buy", "sell"):
+        conn.execute("UPDATE holdings SET quantity=?, avg_cost=? WHERE id=?",
+                     (trade.qty_before, trade.avg_before, h.id))
+    conn.execute("DELETE FROM trades WHERE id=?", (trade.id,))
+
+
+def row_to_price(row: sqlite3.Row) -> Price:
+    return Price(source=str(row["source"] or ""), symbol=str(row["symbol"] or ""), price=to_float(row["price"]),
+                 currency=str(row["currency"] or ""), prev_close=_float_or_none(row["prev_close"]),
+                 fetched_at=str(row["fetched_at"] or ""))
+
+
+def row_to_point(row: sqlite3.Row) -> NetWorthPoint:
+    try:
+        rates = json.loads(row["rates"] or "{}")
+    except ValueError:
+        rates = {}
+    return NetWorthPoint(period=row["period"], currency=_currency(row["currency"]), savings=to_float(row["savings"]),
+                         investments=to_float(row["investments"]), debts=to_float(row["debts"]),
+                         net_worth=to_float(row["net_worth"]), projected_next=_float_or_none(row["projected_next"]),
+                         recorded_at=str(row["recorded_at"] or ""), rates=rates if isinstance(rates, dict) else {})
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +675,8 @@ def migrate(path: str | Path, today: date | None = None) -> MigrationReport:
             report.changes = ensure_schema(conn)
             if version < 1:
                 _migrate_0_to_1(conn, today, report)
+            if version < 2:
+                _migrate_1_to_2(conn, today, report)
             set_meta(conn, schema_version=SCHEMA_VERSION, app_version=APP_VERSION)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         report.bills = conn.execute("SELECT COUNT(*) FROM bills").fetchone()[0]
@@ -542,6 +751,18 @@ def _migrate_0_to_1(conn: sqlite3.Connection, today: date, report: MigrationRepo
              migrated_at=now_text(), created_at=get_meta(conn, "created_at") or now_text())
     if report.legacy:
         report.changes.append(json.dumps({"open_period": str(open_period)}))
+
+
+def _migrate_1_to_2(conn: sqlite3.Connection, today: date, report: MigrationReport) -> None:
+    """4.0 -> 4.1: auto-debit flag on debts, yearly annual-fee status on cards."""
+    # Loans and card bills are normally taken from the bank account; money borrowed from
+    # people is paid by hand.
+    conn.execute("UPDATE bills SET auto_debit = CASE WHEN bill_type='borrow_from_people' THEN 0 ELSE 1 END")
+    # 4.0 only knew "this year's fee is paid": keep it as paid in the current year.
+    conn.execute("UPDATE credit_cards SET fee_paid_period=? WHERE paid_annual_fee=1 AND annual_fee > 0 AND "
+                 "(fee_paid_period IS NULL OR fee_paid_period='')", (str(today.year),))
+    set_meta(conn, upgraded_to_2_at=now_text())
+    report.changes.append("4.1: auto debit, annual fee year")
 
 
 def create_new(path: str | Path, today: date | None = None) -> None:

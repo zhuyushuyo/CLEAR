@@ -14,7 +14,14 @@ from .money import CURRENCIES, DEFAULT_RATES
 log = logging.getLogger(__name__)
 
 # Columns hidden until the user changes them (index per table).
-DEFAULT_HIDDEN = {"bills": [13], "cards": [11, 14], "living": [8, 9], "plan": []}
+DEFAULT_HIDDEN = {"bills": [13], "cards": [13], "living": [8, 9], "plan": [], "invest": [11, 12, 13]}
+
+# Version of the table column layouts. 1 = 4.0, 2 = 4.1 (cards: one annual-fee column;
+# plan: contributions and investments). Saved hidden columns and widths are moved to
+# the new positions once.
+COLUMNS_VERSION = 2
+_CARDS_1_TO_2 = {**{i: i for i in range(11)}, 12: 11, 13: 12, 14: 13}       # old 11 (fee status) is merged
+_PLAN_1_TO_2 = {0: 0, 1: 1, 2: 2, 3: 3, 4: 5, 5: 6, 6: 8, 7: 9}
 
 
 @dataclass
@@ -32,6 +39,10 @@ class AppConfig:
     column_widths: dict = field(default_factory=dict)
     window: dict = field(default_factory=dict)
     welcome_done: bool = False
+    auto_refresh_prices: bool = True   # fetch market prices at start-up (at most every 15 minutes)
+    coingecko_key: str = ""            # optional free "Demo" key
+    debit_prompt_date: str = ""        # last day the "record automatic debits" dialog was shown
+    columns_version: int = COLUMNS_VERSION
     version: str = APP_VERSION
 
     def hidden(self, table: str) -> set[int]:
@@ -55,6 +66,9 @@ def load_config(path: Path) -> AppConfig:
     for f in fields(AppConfig):
         if f.name in data and isinstance(data[f.name], type(defaults[f.name])):
             setattr(cfg, f.name, data[f.name])
+    if "columns_version" not in data:  # written by 4.0
+        cfg.columns_version = 1
+    _migrate_columns(cfg)
     if cfg.theme not in ("system", "light", "dark"):
         cfg.theme = "system"
     if cfg.language not in ("ja", "en"):
@@ -64,13 +78,54 @@ def load_config(path: Path) -> AppConfig:
     rates = dict(DEFAULT_RATES)
     for k, v in (cfg.rates or {}).items():
         try:
-            if k in CURRENCIES and float(v) > 0:
+            # the four display currencies, plus any other currency an investment is quoted in
+            if (k in CURRENCIES or (len(k) == 3 and k.isalpha() and k.isupper())) and float(v) > 0:
                 rates[k] = float(v)
         except (TypeError, ValueError):
             pass
     rates["USD"] = 1.0
     cfg.rates = rates
     return cfg
+
+
+def _remap(indexes, mapping: dict[int, int]) -> list[int]:
+    out = []
+    for i in indexes or []:
+        if isinstance(i, int) and i in mapping:
+            out.append(mapping[i])
+    return sorted(set(out))
+
+
+def _remap_widths(widths, mapping: dict[int, int], size: int) -> list[int]:
+    if not isinstance(widths, list) or not widths:
+        return []
+    new = [0] * size
+    for old, w in enumerate(widths):
+        if old in mapping and isinstance(w, (int, float)):
+            new[mapping[old]] = int(w)
+    return new
+
+
+def _migrate_columns(cfg: AppConfig) -> None:
+    """Move saved hidden columns and widths to the 4.1 column positions (once)."""
+    if cfg.columns_version >= COLUMNS_VERSION:
+        return
+    hidden = dict(cfg.hidden_columns or {})
+    widths = dict(cfg.column_widths or {})
+    if "cards" in hidden:
+        hidden["cards"] = _remap(hidden["cards"], _CARDS_1_TO_2)
+    if "plan" in hidden:
+        hidden["plan"] = _remap(hidden["plan"], _PLAN_1_TO_2)
+    if widths.get("cards"):
+        new = _remap_widths(widths["cards"], _CARDS_1_TO_2, 14)
+        new[10] = max(new[10], 210)  # the annual-fee column now carries the status as well
+        widths["cards"] = new
+    if widths.get("plan"):
+        widths["plan"] = _remap_widths(widths["plan"], _PLAN_1_TO_2, 10)
+    hidden.setdefault("invest", list(DEFAULT_HIDDEN["invest"]))
+    cfg.hidden_columns = hidden
+    cfg.column_widths = widths
+    cfg.columns_version = COLUMNS_VERSION
 
 
 def save_config(cfg: AppConfig, path: Path) -> None:

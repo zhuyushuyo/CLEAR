@@ -114,6 +114,38 @@ def make_legacy_minimal(path: Path) -> Path:
     return path
 
 
+def make_v40(path: Path) -> Path:
+    """Layout written by CLEAR 4.0 (user_version 1): no investments, no auto-debit flag, no fee month."""
+    from clear import db
+
+    added_tables = {"holdings", "trades", "prices", "net_worth"}
+    added_columns = {("bills", "auto_debit"), ("credit_cards", "fee_month"), ("credit_cards", "fee_paid_period")}
+    conn = sqlite3.connect(path)
+    for table, cols in db.SCHEMA.items():
+        if table not in added_tables:
+            body = ", ".join(f"{name} {decl}" for name, decl in cols if (table, name) not in added_columns)
+            conn.execute(f"CREATE TABLE {table} ({body})")
+    conn.executemany("""INSERT INTO bills (bill_type, bill_name, borrower_name, lender_name, amount, currency,
+        interest_rate, monthly_payment, monthly_due_day, created_date, sort_order) VALUES (?,?,?,?,?,?,?,?,?,?,?)""", [
+        ("card_loan", "Loan A", "Yu", "Bank A", 650000, "JPY", 14.0, 25000, 2, "2025-06-01", 1),
+        ("borrow_from_people", "Family", "Yu", "Mother", 200000, "JPY", 0.0, 10000, 1, "2025-06-02", 2),
+    ])
+    conn.executemany("""INSERT INTO credit_cards (issuer, name, due_day, annual_fee, paid_annual_fee, credit_limit,
+        currency, used_amount, created_date) VALUES (?,?,?,?,?,?,?,?,?)""", [
+        ("Card Co", "Gold", 27, 11000, 1, 500000, "JPY", 0, "2025-01-10"),
+        ("Card Co", "Basic", 10, 1375, 0, 300000, "JPY", 0, "2025-01-10"),
+        ("Card Co", "Free", 10, 0, 1, 300000, "JPY", 0, "2025-01-10"),
+    ])
+    conn.executemany("INSERT INTO savings VALUES (?, ?)", [("cumulative_savings", "180000"),
+                                                           ("monthly_income", "320000"), ("income_payment_day", "25")])
+    conn.executemany("INSERT INTO meta VALUES (?, ?)", [("schema_version", "1"), ("app_version", "4.0.0"),
+                                                        ("last_closed_period", "2026-10")])
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+    return path
+
+
 @pytest.fixture
 def today() -> date:
     return TODAY

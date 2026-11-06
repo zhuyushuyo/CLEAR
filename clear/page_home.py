@@ -1,14 +1,18 @@
-"""Home (U3): the four numbers that matter, this month's checklist, warnings and the outlook."""
+"""Home (U3): the numbers that matter, this month's checklist, warnings, the outlook and the
+net-worth history (P1)."""
 
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtWidgets import (QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QTableWidget, QVBoxLayout,
+from PyQt6.QtWidgets import (QAbstractItemView, QBoxLayout, QHBoxLayout, QHeaderView, QLabel, QTableWidget, QVBoxLayout,
                              QWidget)
 
 from . import engine, theme
-from .chart import BreakdownBars, TrendChart
-from .i18n import bill_type_label, category_label, due_text, fmt_md, fmt_period, money, t
+from .chart import BreakdownBars, HistoryChart, TrendChart
+from .i18n import (bill_type_label, category_label, due_text, fmt_md, fmt_period, join_names, label_of, money,
+                   t)
+from .money import convert
+from .periods import Period
 from .shell import Page
 from .widgets import RIGHT, Card, KpiCard, check_item, icon, item, label
 
@@ -25,6 +29,12 @@ def alert_text(a: engine.Alert) -> str:
             p[k] = money(p[k], cur)
     if "period" in p:
         p["period"] = fmt_period(p["period"])
+    if "date" in p:
+        p["date"] = fmt_md(p["date"], weekday=False)  # alerts already sit inside （…）
+    if isinstance(p.get("names"), list):
+        p["names"] = join_names(p["names"])
+    if "frame" in p:
+        p["frame"] = t(f"nisa.frame.{p['frame']}")
     if a.code == "due_soon" and p.get("days") == 0:
         return t("alert.due_today", **p)
     return t(f"alert.{a.code}", **p)
@@ -42,12 +52,13 @@ class HomePage(Page):
         self.k_debt = KpiCard(t("home.kpi.debt"), "fa5s.balance-scale")
         self.k_month = KpiCard(t("home.kpi.month"), "fa5s.calendar-alt")
         self.k_left = KpiCard(t("home.kpi.left"), "fa5s.wallet")
+        self.k_worth = KpiCard(t("home.kpi.worth"), "fa5s.coins")
         self.k_payoff = KpiCard(t("home.kpi.payoff"), "fa5s.flag-checkered")
-        for k in (self.k_debt, self.k_month, self.k_left, self.k_payoff):
-            kpis.addWidget(k)
+        for k in (self.k_debt, self.k_month, self.k_left, self.k_worth, self.k_payoff):
+            kpis.addWidget(k, 1)
         self.body.addLayout(kpis)
 
-        mid = QHBoxLayout()
+        mid = self.mid = QHBoxLayout()
         mid.setSpacing(14)
         self.month_card = Card(t("home.month.title"))
         self.table = QTableWidget(0, 6)
@@ -72,7 +83,7 @@ class HomePage(Page):
         self.month_card.body.addWidget(self.table)
         mid.addWidget(self.month_card, 3)
 
-        right = QVBoxLayout()
+        right = self.right = QVBoxLayout()
         right.setSpacing(14)
         self.alert_card = Card(t("home.alerts.title"))
         self.alert_box = QVBoxLayout()
@@ -91,8 +102,32 @@ class HomePage(Page):
         self.chart = TrendChart()
         self.trend_card.body.addWidget(self.chart)
         self.body.addWidget(self.trend_card)
+        self.history_card = Card(t("home.history.title"), t("home.history.sub"))
+        self.history = HistoryChart()
+        self.history_card.body.addWidget(self.history)
+        self.history_gap = label("", "Hint", wrap=True)
+        self.history_card.body.addWidget(self.history_gap)
+        self.body.addWidget(self.history_card)
         self.body.addStretch(1)
         self._rows: list[engine.DueItem] = []
+        self._narrow: bool | None = None
+
+    # ---- layout -----------------------------------------------------------------------------------
+    NARROW = 1130   # page width below which this month's list takes the whole width
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._arrange(self.width() < self.NARROW)
+
+    def _arrange(self, narrow: bool) -> None:
+        """Wide: the list with the notices beside it. Narrow: the list on top, notices and breakdown below,
+        side by side, so the amounts never slide out of sight."""
+        if narrow == self._narrow:
+            return
+        self._narrow = narrow
+        self.mid.setDirection(QBoxLayout.Direction.TopToBottom if narrow else QBoxLayout.Direction.LeftToRight)
+        self.right.setDirection(QBoxLayout.Direction.LeftToRight if narrow else QBoxLayout.Direction.TopToBottom)
+        self.right.setStretch(1, 1 if narrow else 0)
 
     # ---- refresh ----------------------------------------------------------------------------------
     def refresh(self) -> None:
@@ -112,6 +147,10 @@ class HomePage(Page):
                         t("home.kpi.left_sub", s=money(s.savings_start, cur), i=money(s.income, cur),
                           o=money(s.outflow, cur)),
                         "critical" if s.month_end < 0 else "good" if s.month_end > 0 else None)
+        sv, iv, dv = s.net_worth_parts
+        self.k_worth.set(money(s.net_worth, cur), t("home.kpi.worth_sub", s=money(sv, cur), i=money(iv, cur),
+                                                    d=money(dv, cur)),
+                         "critical" if s.net_worth < 0 else None)
         po = s.payoff
         if po.status == "ok":
             self.k_payoff.set(fmt_period(po.period),
@@ -136,8 +175,39 @@ class HomePage(Page):
             self.trend_card.set_subtitle(t("home.trend.sub_never"))
         else:
             self.trend_card.set_subtitle(t("home.trend.sub_none") if not s.bill_count else "")
+        self.trend_card.title_label.setText(t("home.trend.title_invest" if st.holdings else "home.trend.title"))
         self.chart.set_data([r.period for r in s.trend], [r.debt for r in s.trend], [r.savings for r in s.trend],
-                            po.period if po.status == "ok" else None, cur)
+                            po.period if po.status == "ok" else None, cur, [r.invest for r in s.trend])
+        self._fill_history(cur)
+
+    def _fill_history(self, cur: str) -> None:
+        self.history_card.setVisible(self.store.has_db)
+        points = self.store.net_worth_history()
+        rates = self.store.rates
+        periods, values, projected = [], [], []
+        prev = None
+        for pt in points:
+            per = Period.try_parse(pt.period)
+            if per is None:
+                continue
+            periods.append(per)
+            values.append(convert(pt.net_worth, pt.currency, cur, pt.rates or rates))
+            proj = None
+            if prev is not None and prev[0].add(1) == per and prev[1].projected_next is not None:
+                proj = convert(prev[1].projected_next, prev[1].currency, cur, prev[1].rates or rates)
+            projected.append(proj)
+            prev = (per, pt)
+        self.history.set_data(periods, values, projected, cur)
+        gap = ""
+        for i in range(len(periods) - 1, -1, -1):
+            if projected[i] is not None:
+                diff = values[i] - projected[i]
+                sign = "+" if diff > 0 else ""
+                gap = t("home.history.gap", period=fmt_period(periods[i]), projected=money(projected[i], cur),
+                        actual=money(values[i], cur), diff=f"{sign}{money(diff, cur)}")
+                break
+        self.history_gap.setText(gap)
+        self.history_gap.setVisible(bool(gap))
 
     def _fill_table(self, rows: list[engine.DueItem]) -> None:
         tbl = self.table
@@ -160,31 +230,47 @@ class HomePage(Page):
                     tbl.setItem(r, 5, item(""))
                     continue
                 tbl.setItem(r, 0, check_item(it.paid, r))
-                tbl.setItem(r, 1, item(fmt_md(it.due), tone="text_muted"))
+                tip = t("due.moved_tip", nominal=fmt_md(it.nominal), due=fmt_md(it.due)) if it.moved else None
+                tbl.setItem(r, 1, item(fmt_md(it.due), tone="text_muted", tooltip=tip))
                 tbl.setItem(r, 2, item(it.name))
-                kind = bill_type_label(it.sub) if it.kind == "bill" else category_label(it.sub)
-                tbl.setItem(r, 3, item(kind, tone="text_muted"))
+                kind = self._kind_text(it)
+                tbl.setItem(r, 3, item(kind, tone="text_muted", tooltip=kind))
                 amount = it.paid_amount if it.paid else it.amount
-                tbl.setItem(r, 4, item(money(amount, it.currency), RIGHT))
+                tbl.setItem(r, 4, item(money(amount, it.currency), RIGHT, tone=None if it.counted else "text_muted",
+                                       tooltip=None if it.counted else t("home.month.not_counted")))
                 if it.paid:
-                    status, tone = t("common.paid"), "good"
-                elif it.days < 0:
+                    status, tone = t("common.done_short" if it.kind == "contrib" else "common.paid"), "good"
+                elif it.overdue:
                     status, tone = due_text(it.days), "critical"
+                elif it.pending:
+                    status, tone = t("common.pending"), "warning"
                 elif it.days <= 3:
                     status, tone = due_text(it.days), "warning"
                 else:
                     status, tone = due_text(it.days), "text_muted"
-                tbl.setItem(r, 5, item(status, tone=tone))
+                tbl.setItem(r, 5, item(status, tone=tone, tooltip=t("due.pending_tip") if it.pending else None))
         finally:
             tbl.blockSignals(False)
             # the page scrolls, so the table shows every row instead of scrolling inside
             head_h = tbl.horizontalHeader().sizeHint().height()
             tbl.setFixedHeight(head_h + tbl.rowCount() * tbl.verticalHeader().defaultSectionSize() + 4)
 
+    @staticmethod
+    def _kind_text(it: engine.DueItem) -> str:
+        if it.kind == "bill":
+            return bill_type_label(it.sub)
+        if it.kind == "fee":
+            return t("home.month.fee")
+        if it.kind == "contrib":
+            return t("home.month.contrib", kind=label_of("kind", it.sub)) if it.counted \
+                else t("home.month.contrib_card")
+        return category_label(it.sub)
+
     def _fill_alerts(self, alerts: list[engine.Alert]) -> None:
         while self.alert_box.count():
             w = self.alert_box.takeAt(0).widget()
             if w is not None:
+                w.hide()          # gone at once, not only when the event loop gets round to deleting it
                 w.deleteLater()
         tk = theme.current()
         if not alerts:

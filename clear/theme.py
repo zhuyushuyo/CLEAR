@@ -44,6 +44,13 @@ class Tokens:
     header: str
     selection: str
     selection_text: str
+    # categorical colours (investment kinds) and the investment line of the outlook chart
+    cat1: str = "#2F6BE6"
+    cat2: str = "#E07B39"
+    cat3: str = "#B8922E"
+    cat4: str = "#2A9D8F"
+    cat5: str = "#8E6AC8"
+    invest: str = "#7B5CC4"
 
     def qcolor(self, name: str, alpha: int | None = None) -> QColor:
         c = QColor(getattr(self, name))
@@ -60,6 +67,7 @@ LIGHT = Tokens(
     critical="#C2352E", critical_soft="#FBEBEA", sidebar="#FFFFFF", nav_hover="#F1F3F6",
     nav_active="#E9F0FD", nav_active_text="#2357C4", grid="#ECEFF2", axis="#C6CCD4", muted="#A3ABB5",
     table_alt="#FAFBFC", header="#F6F7F9", selection="#DCE7FC", selection_text="#1C2026",
+    cat1="#2F6BE6", cat2="#E07B39", cat3="#B8922E", cat4="#2A9D8F", cat5="#8E6AC8", invest="#7B5CC4",
 )
 
 DARK = Tokens(
@@ -70,6 +78,7 @@ DARK = Tokens(
     critical="#EE7070", critical_soft="#361C1C", sidebar="#15181B", nav_hover="#1F2329",
     nav_active="#1D2A42", nav_active_text="#9BB9F7", grid="#252A30", axis="#3A4048", muted="#6D7681",
     table_alt="#1D2025", header="#1F2329", selection="#25406E", selection_text="#FFFFFF",
+    cat1="#5C8EF0", cat2="#F0A060", cat3="#D9B54A", cat4="#4FC1B2", cat5="#A98BE0", invest="#A98BE0",
 )
 
 _current: Tokens = LIGHT

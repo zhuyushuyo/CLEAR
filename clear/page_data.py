@@ -13,7 +13,6 @@ from . import backup, logsetup, paths
 from .i18n import LANGUAGES, fmt_datetime, fmt_period, reason_label, t
 from .info import APP_AUTHOR, APP_FULL_NAME, APP_NAME, APP_VERSION, REPO_URL
 from .money import CURRENCIES
-from .periods import Period
 from .shell import Page
 from .widgets import RIGHT, Card, MoneySpin, button, item, label
 
@@ -214,7 +213,8 @@ class DataPage(Page):
             spin.setValue(float(store.rates.get(cur, 1.0)))
         when = store.rates_updated_at()
         if when:
-            src = t("data.rates.src.manual" if store.cfg.rates_source == "manual" else "data.rates.src.auto")
+            src = t({"manual": "data.rates.src.manual", "yahoo": "data.rates.src.yahoo"}.get(
+                store.cfg.rates_source, "data.rates.src.auto"))
             self.rates_when.setText(t("data.rates.updated", when=fmt_datetime(when), source=src))
         else:
             self.rates_when.setText(t("data.rates.never"))

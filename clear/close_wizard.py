@@ -9,13 +9,13 @@ from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QDialog, QFormLayout, QHBoxLayout,
                              QHeaderView, QRadioButton, QStackedWidget, QTableWidget, QVBoxLayout, QWidget)
 
-from . import engine, theme
-from .i18n import bill_type_label, category_label, fmt_period, money, t
-from .money import convert
+from . import engine, invest, theme
+from .i18n import bill_type_label, category_label, fmt_period, label_of, money, t
+from .money import convert, round_money
 from .periods import Period
-from .repo import ClosePlan
+from .repo import ClosePlan, ContribBuy
 from .store import Store
-from .widgets import (CENTER, RIGHT, MoneySpin, button, check_item, divider, item, label, set_tone)
+from .widgets import RIGHT, MoneySpin, button, check_item, divider, item, label
 
 
 class MonthCloseDialog(QDialog):
@@ -30,7 +30,11 @@ class MonthCloseDialog(QDialog):
         state = store.state()
         self.profile = state.profile
         self.rates = store.rates
-        self.items = engine.close_items(state.bills, state.living, period, repo.payments(period))
+        self.holdings = {h.id: h for h in state.holdings}
+        self.prices = state.prices
+        self.trades = repo.trades(period=period)
+        self.items = engine.close_items(state.bills, state.living, period, repo.payments(period), state.cards,
+                                        state.holdings, self.trades)
         self.skip_mode = False
         self.result_plan: ClosePlan | None = None
 
@@ -97,11 +101,15 @@ class MonthCloseDialog(QDialog):
         self.spins: dict[int, MoneySpin] = {}
         tbl.blockSignals(True)
         for r, it in enumerate(self.items):
-            kind = bill_type_label(it.sub) if it.kind == "bill" else category_label(it.sub)
+            kind = self._kind_text(it)
             if it.is_recorded:
                 tbl.setItem(r, 0, check_item(True, r, enabled=False))
                 tbl.setItem(r, 4, item(money(it.recorded.amount, it.currency), RIGHT))
                 tbl.setItem(r, 5, item(t("close.recorded"), tone="good"))
+            elif it.kind == "fee":  # the fee is on the card bill: only paid or not
+                tbl.setItem(r, 0, check_item(True, r))
+                tbl.setItem(r, 4, item(money(it.planned, it.currency), RIGHT))
+                tbl.setItem(r, 5, item(""))
             else:
                 default_pay = it.planned > 0
                 tbl.setItem(r, 0, check_item(default_pay, r))
@@ -123,6 +131,22 @@ class MonthCloseDialog(QDialog):
         self._refresh_notes()
         return page
 
+    @staticmethod
+    def _kind_text(it: engine.CloseItem) -> str:
+        if it.kind == "bill":
+            return bill_type_label(it.sub)
+        if it.kind == "fee":
+            return t("close.kind.fee")
+        if it.kind == "contrib":
+            return t("close.kind.contrib", kind=label_of("kind", it.sub))
+        return category_label(it.sub)
+
+    def _unit_price(self, holding_id: int) -> float | None:
+        h = self.holdings.get(holding_id)
+        if h is None or h.kind == "manual":
+            return None
+        return invest.value_holding(h, self.prices, self.rates, h.currency).unit_price
+
     def _checked(self, row: int) -> bool:
         it = self.table.item(row, 0)
         return bool(it and it.checkState() == Qt.CheckState.Checked)
@@ -136,7 +160,18 @@ class MonthCloseDialog(QDialog):
             if spin is not None:
                 spin.setEnabled(self._checked(r))
             note = self.table.item(r, 5)
-            if self._checked(r):
+            if it.kind == "fee":
+                text, tone = (t("close.fee_card"), "text_muted") if self._checked(r) else (t("common.unpaid"),
+                                                                                          "text_muted")
+            elif it.kind == "contrib" and self._checked(r):
+                h = self.holdings.get(it.target_id)
+                if it.is_card:
+                    text, tone = t("close.contrib_card"), "text_muted"
+                elif h is not None and h.kind != "manual" and not self._unit_price(it.target_id):
+                    text, tone = t("close.no_price"), "warning"
+                else:
+                    text, tone = "", None
+            elif self._checked(r):
                 text, tone = "", None
             elif it.kind == "bill" and it.interest_if_unpaid > 0:
                 text, tone = t("close.accrue", interest=money(it.interest_if_unpaid, it.currency)), "warning"
@@ -191,7 +226,8 @@ class MonthCloseDialog(QDialog):
         lay.addLayout(row)
         lay.addWidget(label(t("close.savings.actual_hint"), "Hint", wrap=True))
         self.reset_other = QCheckBox(t("close.savings.reset_other", what=self.profile.other_income_type or "—",
-                                       amount=money(self.profile.other_income, self.profile.other_income_currency)))
+                                       amount=money(self.profile.other_income, self.profile.other_income_currency))
+                                     .replace("&", "&&"))
         self.reset_other.setChecked(True)
         self.reset_other.setVisible(self.profile.other_income > 0)
         lay.addWidget(self.reset_other)
@@ -211,7 +247,8 @@ class MonthCloseDialog(QDialog):
         return out
 
     def _fill_savings(self) -> None:
-        start, income, outflow, suggested = engine.close_savings(self.profile, self._choices(), self.rates)
+        start, income, outflow, suggested = engine.close_savings(self.profile, self._choices(), self.rates,
+                                                                 self.trades, list(self.holdings.values()))
         cur = self.profile.cumulative_savings_currency
         self.s_start.setText(money(start, cur))
         self.s_income.setText(money(income, cur))
@@ -248,6 +285,18 @@ class MonthCloseDialog(QDialog):
                     plan.bill_payments.append((it.target_id, ch.amount, it.due))
                 elif not ch.pay and it.interest_if_unpaid > 0:
                     plan.accrue_bill_ids.append(it.target_id)
+            elif it.kind == "fee":
+                if ch.pay:
+                    plan.fee_paid_card_ids.append(it.target_id)
+            elif it.kind == "contrib":
+                h = self.holdings.get(it.target_id)
+                if ch.pay and ch.amount > 0 and h is not None:
+                    amount = round_money(convert(ch.amount, h.contrib_currency, h.currency, self.rates), h.currency)
+                    price = self._unit_price(h.id) or 0.0
+                    qty = invest.round_qty(h.kind, amount / price) if price else 0.0
+                    if h.kind == "manual" or qty > 0:   # without a price the units are unknown: not written
+                        plan.contrib_buys.append(ContribBuy(h.id, amount, qty, price, it.due,
+                                                            h.contrib_method == "bank"))
             elif ch.pay and ch.amount > 0:
                 plan.living_payments.append((it.target_id, ch.amount, it.due))
         plan.savings_after = self.s_actual.value()
@@ -271,6 +320,14 @@ class MonthCloseDialog(QDialog):
             t("close.confirm.payments", n=len(plan.bill_payments), amount=money(pay_total, target)),
             t("close.confirm.accruals", n=len(plan.accrue_bill_ids), amount=money(acc_total, target)),
             t("close.confirm.living", n=len(plan.living_payments)),
+        ]
+        if plan.fee_paid_card_ids:
+            lines.append(t("close.confirm.fees", n=len(plan.fee_paid_card_ids)))
+        if plan.contrib_buys:
+            total = sum(convert(b.amount, self.holdings[b.holding_id].currency, target, self.rates)
+                        for b in plan.contrib_buys)
+            lines.append(t("close.confirm.contribs", n=len(plan.contrib_buys), amount=money(total, target)))
+        lines += [
             t("close.confirm.savings", before=money(self.profile.cumulative_savings, cur),
               after=money(plan.savings_after, cur)),
         ]

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QHBoxLayout, QTabWidget, QVBoxLayout, QWidget
 
 from . import engine
 from .dialogs import DEFAULT_WIDTHS, TABLE_COLUMNS
-from .i18n import bill_type_label, due_text, fmt_date, fmt_period, money, t
+from .i18n import bill_type_label, due_text, fmt_date, fmt_md, fmt_period, money, month_name, t
 from .money import convert, fmt_number
+from .periods import Period
 from .shell import Page
 from .widgets import CENTER, RIGHT, DataTable, ReorderTable, button, item, label
 
@@ -56,11 +56,12 @@ class DebtsPage(Page):
         bar2 = QHBoxLayout()
         bar2.addWidget(button(t("debts.add_card"), "primary", "fa5s.plus", window.add_card))
         bar2.addWidget(button(t("common.edit"), None, "fa5s.pen", self._edit_card))
+        bar2.addWidget(button(t("cards.fee_toggle"), None, "fa5s.check", self._toggle_fee))
         bar2.addWidget(button(t("common.delete"), "danger", "fa5s.trash-alt", self._delete_card))
         bar2.addStretch(1)
         lay2.addLayout(bar2)
         self.cards = DataTable("cards", [t(k) for k in TABLE_COLUMNS["cards"]])
-        self.cards.right_align((3, 4, 5, 6, 7, 8, 9, 10))
+        self.cards.right_align((3, 4, 5, 6, 7, 8, 9))
         self.cards.itemDoubleClicked.connect(lambda _i: self._edit_card())
         self.cards.widthsChanged.connect(window.save_widths)
         lay2.addWidget(self.cards, 1)
@@ -94,7 +95,8 @@ class DebtsPage(Page):
             tot_month += convert(this_month, b.currency, target, rates)
             if b.amount > 0 and not b.is_lump_sum:
                 tot_monthly += convert(b.monthly_payment, b.currency, target, rates)
-            due = cur_period.day(b.monthly_due_day)
+            due = engine.due_date(cur_period, b.monthly_due_day)
+            nominal = cur_period.day(b.monthly_due_day)
             days = (due - st.today).days
             underwater = engine.is_underwater(b)
             tbl.setItem(r, 0, item(b.label, data=b.id, bold=True))
@@ -114,9 +116,18 @@ class DebtsPage(Page):
             elif b.amount <= 0:
                 tbl.setItem(r, 9, item(t("due.cell_day", day=b.monthly_due_day), tone="text_muted"))
                 tbl.setItem(r, 10, item("—", tone="text_faint"))
+            elif days < 0 and b.auto_debit:
+                tbl.setItem(r, 9, item(t("due.cell_pending", day=b.monthly_due_day), tone="warning",
+                                       tooltip=t("due.pending_tip")))
+                tbl.setItem(r, 10, item(t("common.pending"), tone="warning", tooltip=t("due.pending_tip")))
             else:
                 tone = "critical" if days < 0 else "warning" if days <= 3 else None
-                tbl.setItem(r, 9, item(t("due.cell", day=b.monthly_due_day, rel=due_text(days)), tone=tone))
+                if due != nominal:
+                    text = t("due.cell_moved", day=b.monthly_due_day, moved=fmt_md(due, weekday=False), rel=due_text(days))
+                    tip = t("due.moved_tip", nominal=fmt_md(nominal), due=fmt_md(due))
+                else:
+                    text, tip = t("due.cell", day=b.monthly_due_day, rel=due_text(days)), None
+                tbl.setItem(r, 9, item(text, tone=tone, tooltip=tip))
                 tbl.setItem(r, 10, item(t("common.unpaid"), tone="critical" if days < 0 else "text_muted"))
             if info.status == "ok":
                 tbl.setItem(r, 11, item(fmt_period(info.period)))
@@ -138,7 +149,8 @@ class DebtsPage(Page):
         target, rates = self.store.currency, self.store.rates
         tbl = self.cards
         tbl.setRowCount(len(st.cards))
-        tl = tu = ta = 0.0
+        tl = tu = ta = fees = 0.0
+        unpaid = 0
         for r, c in enumerate(st.cards):
             tl += convert(c.credit_limit, c.currency, target, rates)
             tu += convert(c.used_amount, c.currency, target, rates)
@@ -156,19 +168,21 @@ class DebtsPage(Page):
             tbl.setItem(r, 7, item(fmt_number(c.shopping_credit_amount, c.currency), RIGHT))
             tbl.setItem(r, 8, item(fmt_number(c.shopping_revolving_amount, c.currency), RIGHT))
             tbl.setItem(r, 9, item(fmt_number(c.cash_revolving_amount, c.currency), RIGHT))
-            if c.annual_fee <= 0:
-                tbl.setItem(r, 10, item("—", RIGHT, tone="text_faint"))
-                tbl.setItem(r, 11, item("—", tone="text_faint"))
-            else:
-                tbl.setItem(r, 10, item(fmt_number(c.annual_fee, c.currency), RIGHT))
-                tbl.setItem(r, 11, item(t("common.paid") if c.paid_annual_fee else t("common.unpaid"),
-                                        tone="good" if c.paid_annual_fee else "warning"))
-            tbl.setItem(r, 12, item(c.currency, CENTER, tone="text_muted"))
-            tbl.setItem(r, 13, item("✓" if c.managed_in_bills else "—", CENTER,
+            text, tone = fee_text(c, st)
+            if c.annual_fee > 0:
+                fees += convert(c.annual_fee, c.currency, target, rates)
+                if engine.fee_status(c, st.today).state == "due":
+                    unpaid += 1
+            tbl.setItem(r, 10, item(text, tone=tone))
+            tbl.setItem(r, 11, item(c.currency, CENTER, tone="text_muted"))
+            tbl.setItem(r, 12, item("✓" if c.managed_in_bills else "—", CENTER,
                                     tone="good" if c.managed_in_bills else "text_faint"))
-            tbl.setItem(r, 14, item(fmt_date(c.last_updated), tone="text_muted"))
-        self.cards_footer.setText(t("cards.footer", cur=target, limit=money(tl, target), used=money(tu, target),
-                                    avail=money(ta, target)))
+            tbl.setItem(r, 13, item(fmt_date(c.last_updated), tone="text_muted"))
+        footer = t("cards.footer", cur=target, limit=money(tl, target), used=money(tu, target),
+                   avail=money(ta, target))
+        if fees > 0:
+            footer += "  ・" + t("cards.footer_fee", total=money(fees, target), n=unpaid)
+        self.cards_footer.setText(footer)
 
     # ---- actions -----------------------------------------------------------------------------------------
     def _selected_bill(self):
@@ -207,6 +221,13 @@ class DebtsPage(Page):
             return
         self.win.edit_card(c)
 
+    def _toggle_fee(self) -> None:
+        c = self._selected_card()
+        if c is None:
+            self.win.notify(t("common.select_row"))
+            return
+        self.win.toggle_fee(c)
+
     def _delete_card(self) -> None:
         c = self._selected_card()
         if c is None:
@@ -222,6 +243,25 @@ class DebtsPage(Page):
         ids.insert(dst, moved)
         self.store.reorder_bills(ids)
         self.bills.selectRow(dst)
+
+
+def fee_text(card, st) -> tuple[str, str | None]:
+    """The annual-fee cell (B1): amount, status and the month it is (or was) billed."""
+    fs = engine.fee_status(card, st.today)
+    amount = fmt_number(card.annual_fee, card.currency)
+    if fs.state == "free":
+        return t("fee.free"), "text_faint"
+    if fs.state == "paid":
+        marker = Period.try_parse(fs.paid_label)
+        when = fmt_period(marker) if marker else t("fee.year", year=fs.paid_label[:4])
+        return t("fee.paid", amount=amount, when=when), "good"
+    if fs.state == "due":
+        this_month = fs.cycle == st.current
+        when = month_name(fs.cycle.month) if this_month else fmt_period(fs.cycle)
+        return t("fee.due", amount=amount, when=when), "warning" if this_month else "critical"
+    if fs.state == "upcoming":
+        return t("fee.next", amount=amount, when=fmt_period(fs.next_bill)), "text_muted"
+    return t("fee.no_month", amount=amount), "warning"
 
 
 def alert_tip(b) -> str:

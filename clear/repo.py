@@ -9,10 +9,24 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
-from . import db, engine
-from .models import Bill, CreditCard, LivingCost, Payment, Profile
+from . import db, engine, invest
+from .models import Bill, CreditCard, Holding, LivingCost, NetWorthPoint, Payment, Price, Profile, Trade
 from .money import round_money
 from .periods import Period
+
+RETURN_KEYS = {kind: f"return_{kind}" for kind in invest.DEFAULT_RETURNS}
+
+
+@dataclass
+class ContribBuy:
+    """A monthly contribution to record at the close (amount in the holding currency)."""
+
+    holding_id: int
+    amount: float
+    quantity: float
+    price: float
+    trade_date: date
+    cash_effect: bool = True
 
 
 @dataclass
@@ -23,6 +37,8 @@ class ClosePlan:
     bill_payments: list[tuple[int, float, date]] = field(default_factory=list)   # (bill id, amount, date)
     accrue_bill_ids: list[int] = field(default_factory=list)
     living_payments: list[tuple[int, float, date]] = field(default_factory=list)
+    fee_paid_card_ids: list[int] = field(default_factory=list)
+    contrib_buys: list[ContribBuy] = field(default_factory=list)
     savings_after: float | None = None
     reset_other_income: bool = True
 
@@ -102,11 +118,19 @@ class Repository:
             last_closed = Period.try_parse(db.get_meta(c, "last_closed_period"))
             pays = [db.row_to_payment(r) for r in
                     c.execute("SELECT * FROM payments WHERE period=? ORDER BY id", (str(current),))]
+            holdings = [db.row_to_holding(r) for r in c.execute("SELECT * FROM holdings ORDER BY sort_order, id")]
+            prices = {p.key: p for p in (db.row_to_price(r) for r in c.execute("SELECT * FROM prices"))}
+            trades_year = [db.row_to_trade(r) for r in c.execute(
+                "SELECT * FROM trades WHERE trade_date >= ? ORDER BY id", (f"{today.year:04d}-01-01",))]
+            returns = self._returns(c)
         return engine.State(
             bills=bills, living=living, cards=cards, profile=profile, today=today,
             last_closed=last_closed if last_closed is not None else current.add(-1),
             paid_bills=engine.aggregate_payments(pays, "bill"),
             paid_living=engine.aggregate_payments(pays, "living"),
+            holdings=holdings, prices=prices, returns=returns,
+            trades_month=[tr for tr in trades_year if tr.period == str(current)],
+            trades_year=trades_year,
         )
 
     # ---- bills ----------------------------------------------------------------------
@@ -169,6 +193,130 @@ class Repository:
         with closing(self._conn()) as c, db.tx(c):
             c.execute("DELETE FROM credit_cards WHERE id=?", (card_id,))
 
+    def set_fee_paid(self, card_id: int, period: Period | None) -> None:
+        """Mark the card's annual fee as paid in `period` (None: not paid)."""
+        with closing(self._conn()) as c, db.tx(c):
+            c.execute("UPDATE credit_cards SET fee_paid_period=?, paid_annual_fee=? WHERE id=?",
+                      (str(period) if period else "", 1 if period else 0, card_id))
+
+    # ---- investments --------------------------------------------------------------------
+    def holdings(self) -> list[Holding]:
+        with closing(self._conn()) as c:
+            return [db.row_to_holding(r) for r in c.execute("SELECT * FROM holdings ORDER BY sort_order, id")]
+
+    def add_holding(self, h: Holding) -> Holding:
+        with closing(self._conn()) as c, db.tx(c):
+            if not h.sort_order:
+                h.sort_order = (c.execute("SELECT COALESCE(MAX(sort_order), 0) FROM holdings").fetchone()[0] or 0) + 1
+            cur = c.execute(f"INSERT INTO holdings ({', '.join(db.HOLDING_COLUMNS)}) VALUES "
+                            f"({', '.join('?' for _ in db.HOLDING_COLUMNS)})", db.holding_values(h))
+            h.id = cur.lastrowid
+        return h
+
+    def update_holding(self, h: Holding) -> None:
+        with closing(self._conn()) as c, db.tx(c):
+            c.execute(f"UPDATE holdings SET {', '.join(x + '=?' for x in db.HOLDING_COLUMNS)} WHERE id=?",
+                      (*db.holding_values(h), h.id))
+
+    def delete_holding(self, holding_id: int) -> None:
+        with closing(self._conn()) as c, db.tx(c):
+            c.execute("DELETE FROM trades WHERE holding_id=?", (holding_id,))
+            c.execute("DELETE FROM holdings WHERE id=?", (holding_id,))
+
+    def reorder_holdings(self, ordered_ids: list[int]) -> None:
+        with closing(self._conn()) as c, db.tx(c):
+            c.executemany("UPDATE holdings SET sort_order=? WHERE id=?",
+                          [(i + 1, hid) for i, hid in enumerate(ordered_ids)])
+
+    def trades(self, holding_id: int | None = None, period: Period | None = None) -> list[Trade]:
+        sql, args = "SELECT * FROM trades", []
+        where = []
+        if holding_id is not None:
+            where.append("holding_id=?")
+            args.append(holding_id)
+        if period is not None:
+            where.append("period=?")
+            args.append(str(period))
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        with closing(self._conn()) as c:
+            return [db.row_to_trade(r) for r in c.execute(sql + " ORDER BY trade_date, id", args)]
+
+    def record_trade(self, holding_id: int, kind: str, trade_date: date, **kw) -> Trade:
+        with closing(self._conn()) as c, db.tx(c):
+            return db.insert_trade(c, holding_id, kind, trade_date, **kw)
+
+    def last_trade(self, holding_id: int, contrib_period: Period | None = None) -> Trade | None:
+        sql = "SELECT * FROM trades WHERE holding_id=?"
+        args: list = [holding_id]
+        if contrib_period is not None:
+            sql += " AND is_contrib=1 AND period=?"
+            args.append(str(contrib_period))
+        with closing(self._conn()) as c:
+            row = c.execute(sql + " ORDER BY id DESC LIMIT 1", args).fetchone()
+            return db.row_to_trade(row) if row else None
+
+    def undo_last_trade(self, holding_id: int, contrib_period: Period | None = None) -> Trade | None:
+        """Undo the holding's latest trade (or its latest contribution of the month).
+
+        Only the very latest trade of a holding can be undone, so the stored "before"
+        values are always the right ones to put back."""
+        with closing(self._conn()) as c, db.tx(c):
+            row = c.execute("SELECT * FROM trades WHERE holding_id=? ORDER BY id DESC LIMIT 1",
+                            (holding_id,)).fetchone()
+            if row is None:
+                return None
+            tr = db.row_to_trade(row)
+            if contrib_period is not None and (not tr.is_contrib or tr.period != str(contrib_period)):
+                return None
+            db.undo_trade(c, tr)
+            return tr
+
+    def prices(self) -> dict[str, Price]:
+        with closing(self._conn()) as c:
+            return {p.key: p for p in (db.row_to_price(r) for r in c.execute("SELECT * FROM prices"))}
+
+    def save_prices(self, prices: list[Price]) -> None:
+        if not prices:
+            return
+        with closing(self._conn()) as c, db.tx(c):
+            c.executemany("INSERT OR REPLACE INTO prices (key, source, symbol, price, prev_close, currency, fetched_at)"
+                          " VALUES (?,?,?,?,?,?,?)",
+                          [(p.key, p.source, p.symbol, p.price, p.prev_close, p.currency, p.fetched_at)
+                           for p in prices])
+
+    @staticmethod
+    def _returns(c: sqlite3.Connection) -> dict[str, float]:
+        out = dict(invest.DEFAULT_RETURNS)
+        for kind, key in RETURN_KEYS.items():
+            raw = db.get_meta(c, key, "")
+            try:
+                out[kind] = float(raw) if raw != "" else out[kind]
+            except ValueError:
+                pass
+        return out
+
+    def returns(self) -> dict[str, float]:
+        with closing(self._conn()) as c:
+            return self._returns(c)
+
+    def save_returns(self, values: dict[str, float]) -> None:
+        with closing(self._conn()) as c, db.tx(c):
+            db.set_meta(c, **{RETURN_KEYS[k]: float(v) for k, v in values.items() if k in RETURN_KEYS})
+
+    # ---- net worth history (P1) -------------------------------------------------------------
+    def save_net_worth(self, point: NetWorthPoint) -> None:
+        with closing(self._conn()) as c, db.tx(c):
+            c.execute("INSERT OR REPLACE INTO net_worth (period, recorded_at, currency, savings, investments, debts,"
+                      " net_worth, projected_next, rates) VALUES (?,?,?,?,?,?,?,?,?)",
+                      (point.period, point.recorded_at or db.now_text(), point.currency, point.savings,
+                       point.investments, point.debts, point.net_worth, point.projected_next,
+                       json.dumps(point.rates or {})))
+
+    def net_worth_history(self) -> list[NetWorthPoint]:
+        with closing(self._conn()) as c:
+            return [db.row_to_point(r) for r in c.execute("SELECT * FROM net_worth ORDER BY period")]
+
     # ---- profile ------------------------------------------------------------------------
     def save_profile(self, profile: Profile) -> None:
         with closing(self._conn()) as c, db.tx(c):
@@ -218,6 +366,16 @@ class Repository:
                 if row is not None:
                     db.insert_living_payment(c, lc_id, plan.period, paid_date, amount, row[0] or "JPY", "close")
                     summary["living"] += 1
+            for card_id in plan.fee_paid_card_ids:
+                c.execute("UPDATE credit_cards SET fee_paid_period=?, paid_annual_fee=1 WHERE id=?",
+                          (str(plan.period), card_id))
+                summary["fees"] = summary.get("fees", 0) + 1
+            for buy in plan.contrib_buys:
+                if c.execute("SELECT 1 FROM holdings WHERE id=?", (buy.holding_id,)).fetchone() is None:
+                    continue
+                db.insert_trade(c, buy.holding_id, "buy", buy.trade_date, quantity=buy.quantity, price=buy.price,
+                                amount=buy.amount, is_contrib=True, cash_effect=buy.cash_effect, note="close")
+                summary["contributions"] = summary.get("contributions", 0) + 1
             profile = db.load_profile(c)
             summary["savings_before"] = profile.cumulative_savings
             if plan.savings_after is not None:

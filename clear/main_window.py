@@ -5,19 +5,23 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer, QUrl
+from PyQt6.QtCore import QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices, QGuiApplication, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QHBoxLayout, QInputDialog, QMainWindow,
                              QStackedWidget, QVBoxLayout, QWidget)
 
-from . import db, i18n, paths, theme
+from . import db, engine, i18n, invest, paths, theme
 from .close_wizard import MonthCloseDialog
-from .dialogs import DELETE, BillDialog, CardDialog, ColumnsDialog, LivingDialog, PaymentDialog
-from .i18n import fmt_datetime, fmt_period, money, t
+from .dialogs import DELETE, TABLE_COLUMNS, BillDialog, CardDialog, ColumnsDialog, DebitDialog, LivingDialog, \
+    PaymentDialog
+from .dialogs_invest import HoldingDialog, InvestSettingsDialog, TradeDialog
+from .i18n import fmt_date, fmt_datetime, fmt_md, fmt_period, join_names, money, t
 from .info import APP_NAME, APP_VERSION
+from .money import unit
 from .page_data import DataPage
 from .page_debts import DebtsPage
 from .page_home import HomePage
+from .page_invest import InvestPage
 from .page_monthly import MonthlyPage
 from .page_plan import PlanPage
 from .periods import Period
@@ -28,7 +32,7 @@ from .widgets import Banner, ask, ask3, error, info
 
 log = logging.getLogger(__name__)
 
-PAGES = (HomePage, DebtsPage, MonthlyPage, PlanPage, DataPage)
+PAGES = (HomePage, DebtsPage, MonthlyPage, InvestPage, PlanPage, DataPage)
 
 
 class MainWindow(QMainWindow):
@@ -53,8 +57,8 @@ class MainWindow(QMainWindow):
             QGuiApplication.styleHints().colorSchemeChanged.connect(self._system_theme_changed)
         except AttributeError:  # Qt < 6.5
             pass
-        for key, page in (("Ctrl+1", 0), ("Ctrl+2", 1), ("Ctrl+3", 2), ("Ctrl+4", 3), ("Ctrl+5", 4)):
-            QShortcut(QKeySequence(key), self, activated=lambda p=page: self.navigate(p))
+        for page in range(len(PAGES)):
+            QShortcut(QKeySequence(f"Ctrl+{page + 1}"), self, activated=lambda p=page: self.navigate(p))
         QShortcut(QKeySequence("F5"), self, activated=self.refresh)
 
     # ---- layout -----------------------------------------------------------------------------------------
@@ -121,7 +125,12 @@ class MainWindow(QMainWindow):
             self.banner.show_message(t("banner.no_db"), t("banner.no_db_action"), self.open_file_dialog, "info")
         else:
             due = store.due_close_periods()
-            if not due:
+            debits = store.pending_debits() if not due else []
+            if not due and debits:
+                dates = join_names([fmt_md(d, weekday=False) for d in sorted({it.due for it in debits})])
+                self.banner.show_message(t("banner.debits", n=len(debits), dates=dates), t("banner.debits_action"),
+                                         self.review_debits)
+            elif not due:
                 self.banner.hide()
             elif len(due) == 1:
                 self.banner.show_message(t("banner.close_due", period=fmt_period(due[0])),
@@ -175,7 +184,35 @@ class MainWindow(QMainWindow):
             if last is not None and last.exists():
                 self.open_path(last, quiet=True)
         store.auto_update_rates()
+        if store.cfg.auto_refresh_prices:
+            store.refresh_market(quiet=True)
         self.refresh()
+        QTimer.singleShot(0, self.maybe_prompt_debits)
+
+    # ---- automatic debits (B2) ------------------------------------------------------------------------------
+    def maybe_prompt_debits(self, force: bool = False) -> None:
+        store = self.store
+        if not store.has_db or store.due_close_periods():
+            return
+        items = store.pending_debits()
+        if not items:
+            if force:
+                self.refresh()
+            return
+        today = store.today().isoformat()
+        if not force and store.cfg.debit_prompt_date == today:
+            return
+        store.cfg.debit_prompt_date = today
+        store.save_config()
+        dlg = DebitDialog(self, items)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            rows = dlg.chosen()
+            result: list = []
+            if rows and self.guard(lambda: result.append(store.record_debits(rows))):
+                self.notify(t("debit.done", n=result[0] if result else 0))
+
+    def review_debits(self) -> None:
+        self.maybe_prompt_debits(force=True)
 
     def run_welcome(self) -> None:
         store = self.store
@@ -234,7 +271,9 @@ class MainWindow(QMainWindow):
 
     def open_path(self, path: Path, quiet: bool = False) -> None:
         try:
-            self.store.open_db(path)
+            report = self.store.open_db(path)
+            if report.migrated and report.from_version >= 1:
+                self.notify(t("import.upgraded", name=path.name))
         except LegacyFileError:
             if ask(self, t("import.legacy_q", name=path.name)):
                 self._import_files([path])
@@ -321,6 +360,8 @@ class MainWindow(QMainWindow):
         remaining = self.store.due_close_periods()
         if remaining and ask(self, t("close.more_q", period=fmt_period(remaining[0]))):
             QTimer.singleShot(0, self.start_close)
+        elif not remaining:
+            QTimer.singleShot(0, self.maybe_prompt_debits)
 
     def undo_close(self) -> None:
         last = self.store.latest_close()
@@ -351,12 +392,35 @@ class MainWindow(QMainWindow):
             self.guard(lambda: self.store.add_bill(dlg.result_bill()))
 
     def edit_bill(self, bill) -> None:
-        dlg = BillDialog(self, bill, self.store.state().current, self.store.currency)
+        st = self.store.state()
+        dlg = BillDialog(self, bill, st.current, self.store.currency)
         result = dlg.exec()
-        if result == QDialog.DialogCode.Accepted:
-            self.guard(lambda: self.store.update_bill(dlg.result_bill()))
-        elif result == DELETE:
+        if result == DELETE:
             self.delete_bill(bill)
+            return
+        if result != QDialog.DialogCode.Accepted:
+            return
+        new = dlg.result_bill()
+        old_balance = bill.amount
+        drop = old_balance - new.amount
+        if new.currency == bill.currency and drop >= unit(bill.currency):
+            # B2: a lower balance usually means a payment went out; record it as one so the
+            # month is not shown as unpaid and nothing is subtracted twice later.
+            choice = ask3(self, t("bill.balance_drop_q", drop=money(drop, bill.currency),
+                                  old=money(old_balance, bill.currency), new=money(new.amount, bill.currency)),
+                          t("bill.balance_drop_pay"), t("bill.balance_drop_fix"))
+            if choice == 0:
+                return
+            if choice == 1:
+                paid = st.paid_bills.get(bill.id)
+                pay = PaymentDialog(self, bill, st.current, self.store.today(), bool(paid and paid.paid),
+                                    new_balance=new.amount)
+                if pay.exec() != QDialog.DialogCode.Accepted:
+                    return
+                d, amount, _interest, note = pay.values()
+                self.guard(lambda: self.store.update_bill_with_payment(new, old_balance, d, amount, note))
+                return
+        self.guard(lambda: self.store.update_bill(new))
 
     def delete_bill(self, bill) -> None:
         if ask(self, t("debts.confirm_delete", name=bill.label), t("common.delete"), danger=True):
@@ -393,6 +457,32 @@ class MainWindow(QMainWindow):
                 self.guard(lambda: self.store.record_living_payment(lc))
             else:
                 self.guard(lambda: self.store.undo_payment("living", lc.id))
+        elif kind == "fee":
+            card = next((c for c in st.cards if c.id == target_id), None)
+            if card is None:
+                return
+            if checked:
+                self.guard(lambda: self.store.set_fee_paid(card.id, True))
+            elif ask(self, t("cards.fee_undo_q", name=card.label)):
+                self.guard(lambda: self.store.set_fee_paid(card.id, False))
+            else:
+                self.refresh()
+        elif kind == "contrib":
+            h = next((x for x in st.holdings if x.id == target_id), None)
+            if h is None:
+                return
+            if checked:
+                due = engine.due_date(st.current, h.contrib_day)
+                when = due if due <= self.store.today() else self.store.today()
+                result: list = []
+                if self.guard(lambda: result.append(self.store.record_contribution(h, when))):
+                    if result[0] is None:
+                        self.refresh()                    # the tick goes back
+                        info(self, t("invest.contrib_no_price"))
+                    else:
+                        self.notify(t("invest.contrib_done", name=h.label))
+            else:
+                self.guard(lambda: self.store.undo_contribution(h.id))
 
     # ---- living costs and cards -----------------------------------------------------------------------------
     def add_living(self) -> None:
@@ -417,12 +507,23 @@ class MainWindow(QMainWindow):
     def add_card(self) -> None:
         if not self._need_db():
             return
-        dlg = CardDialog(self, None, self.store.currency)
+        dlg = CardDialog(self, None, self.store.currency, self.store.today())
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.guard(lambda: self.store.add_card(dlg.result_card()))
 
+    def toggle_fee(self, card) -> None:
+        """B1: mark the card's annual fee paid for the current cycle, or back to unpaid."""
+        status = engine.fee_status(card, self.store.today())
+        if status.state == "free":
+            self.notify(t("cards.fee_free"))
+        elif status.state == "paid":
+            if ask(self, t("cards.fee_undo_q", name=card.label)):
+                self.guard(lambda: self.store.set_fee_paid(card.id, False))
+        elif self.guard(lambda: self.store.set_fee_paid(card.id, True)):
+            self.notify(t("cards.fee_marked", name=card.label))
+
     def edit_card(self, card) -> None:
-        dlg = CardDialog(self, card, self.store.currency)
+        dlg = CardDialog(self, card, self.store.currency, self.store.today())
         result = dlg.exec()
         if result == QDialog.DialogCode.Accepted:
             self.guard(lambda: self.store.update_card(dlg.result_card()))
@@ -433,10 +534,64 @@ class MainWindow(QMainWindow):
         if ask(self, t("cards.confirm_delete", name=card.label), t("common.delete"), danger=True):
             self.guard(lambda: self.store.delete_card(card.id))
 
+    # ---- investments ----------------------------------------------------------------------------------------------
+    def add_holding(self) -> None:
+        if not self._need_db():
+            return
+        dlg = HoldingDialog(self, self.store, None, self.store.currency)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            if self.guard(lambda: self.store.add_holding(dlg.result_holding())):
+                self.store.refresh_market(force=True, quiet=True)
+
+    def edit_holding(self, h) -> None:
+        dlg = HoldingDialog(self, self.store, h, self.store.currency)
+        result = dlg.exec()
+        if result == QDialog.DialogCode.Accepted:
+            new = dlg.result_holding()
+            if self.guard(lambda: self.store.update_holding(new)) and invest.quote_ref(new) != invest.quote_ref(h):
+                self.store.refresh_market(force=True, quiet=True)
+        elif result == DELETE:
+            self.delete_holding(h)
+
+    def delete_holding(self, h) -> None:
+        if ask(self, t("invest.confirm_delete", name=h.label), t("common.delete"), danger=True):
+            self.guard(lambda: self.store.delete_holding(h.id))
+
+    def record_trade(self, h) -> None:
+        st = self.store.state()
+        hv = invest.value_holding(h, st.prices, self.store.rates, h.currency)
+        dlg = TradeDialog(self, h, self.store.today(), hv.unit_price)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            v = dlg.values()
+            kind, when = v.pop("kind"), v.pop("trade_date")
+            self.guard(lambda: self.store.record_trade(h.id, kind, when, **v))
+
+    def undo_trade(self, h) -> None:
+        last = self.store.repo.last_trade(h.id) if self.store.repo else None
+        if last is None:
+            self.notify(t("invest.undo_none"))
+            return
+        key = f"trade.m.{last.kind}" if h.kind == "manual" and last.kind in ("buy", "sell") else f"trade.{last.kind}"
+        if ask(self, t("invest.undo_q", name=h.label, when=fmt_date(last.trade_date), kind=t(key),
+                       amount=money(last.amount, last.currency)), t("pay.undo")):
+            self.guard(lambda: self.store.undo_last_trade(h.id))
+
+    def invest_settings(self) -> None:
+        if not self._need_db():
+            return
+        cfg = self.store.cfg
+        dlg = InvestSettingsDialog(self, self.store.returns(), cfg.auto_refresh_prices, cfg.coingecko_key)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            returns, auto, key = dlg.values()
+            cfg.auto_refresh_prices, cfg.coingecko_key = auto, key
+            self.store.save_config()
+            if self.guard(lambda: self.store.save_returns(returns)):
+                self.notify(t("iset.saved"))
+
     # ---- display ------------------------------------------------------------------------------------------------
     def choose_columns(self) -> None:
         cfg = self.store.cfg
-        hidden = {k: sorted(cfg.hidden(k)) for k in ("bills", "cards", "living", "plan")}
+        hidden = {k: sorted(cfg.hidden(k)) for k in TABLE_COLUMNS}
         dlg = ColumnsDialog(self, hidden)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             cfg.hidden_columns = dlg.result_hidden()
