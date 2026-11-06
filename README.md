@@ -5,7 +5,7 @@
 借入の返済、毎月の家計、投資を合わせて、純資産の見通しを管理するデスクトップアプリです。
 Payback Management 3.x（Personal Finance Manager Pro）の後継版です。
 
-- 版: 4.1.0
+- 版: 4.1.1
 - 開発: Yu ZHU
 - ライセンス: Apache License 2.0
 - English summary: [below](#english)
@@ -27,7 +27,7 @@ Payback Management 3.x（Personal Finance Manager Pro）の後継版です。
   注意すべきこと、負債・貯蓄・投資の見通しと純資産の実績のグラフ。
 - **4通貨**: JPY・USD・CNY・SGD。表示通貨はヘッダーで切り替え、すべての画面に効きます。
 - **データを安全に**: データファイルはアプリのフォルダの外に置き、起動時（1日1回）・月次締めの前・復元の前・形式の移行の前に自動でバックアップを作ります（直近30個）。
-- **表示**: ライト・ダーク・システムに合わせる、のテーマ。日本語と英語。
+- **表示**: ライト・ダーク・システムに合わせる、のテーマ。日本語と英語。専用のアイコン（ウィンドウ・Dock・タスクバー）。
 
 ## 動作環境
 
@@ -35,7 +35,7 @@ Payback Management 3.x（Personal Finance Manager Pro）の後継版です。
 - macOS または Windows
 - ライブラリ: PyQt6、qtawesome、requests、yfinance、jpholiday
 
-yfinance がなくてもアプリは動きます。その場合、株・貴金属の価格は手入力になり、投資のページに入れ方を案内します。
+yfinance がなくてもアプリは動きます。その場合は、株・貴金属・為替の価格を Yahoo Finance から直接取得します。
 jpholiday がない場合は、土日と年末年始だけを銀行の休業日として数えます。
 
 ## 起動のしかた
@@ -99,17 +99,19 @@ python3 -m venv ~/.venvs/clear
 
 ## 投資のページ
 
-| 種類 | 登録のしかた | 価格の取得元 |
+| 種類 | 登録のしかた | 価格の取得元（取れないときは右へ） |
 | --- | --- | --- |
-| 株・ETF | 日本株は `7203.T`、米国株・ETF は `AAPL` や `VOO`。「検索」で名前からも探せます | Yahoo Finance（yfinance） |
-| 仮想通貨 | `bitcoin` のような CoinGecko の ID。数量は小数点以下8桁まで | CoinGecko（任意で bitFlyer） |
-| 貴金属 | 金・銀・プラチナ・パラジウムを、グラム・トロイオンス・キログラムで | ニューヨーク先物（yfinance）。店頭価格との差は補正率（%）で調整 |
+| 株・ETF | 日本株は `7203`（自動で `7203.T` に）、米国株・ETF は `AAPL` や `VOO`。「検索」で名前からも探せます。数量は株数（整数） | yfinance → Yahoo Finance を直接 |
+| 仮想通貨 | `bitcoin` のような CoinGecko の ID。`BTC` のようなティッカーでも登録できます。数量は小数点以下8桁まで | CoinGecko → Coinbase → bitFlyer（任意で bitFlyer だけも可） |
+| 貴金属 | 金・銀・プラチナ・パラジウムを、グラム・トロイオンス・キログラムで | ニューヨーク先物（yfinance → Yahoo Finance を直接）。店頭価格との差は補正率（%）で調整 |
 | 手入力の資産 | 投資信託・外貨預金など。今の評価額を手で入れます | 手入力 |
 
+- 為替は Yahoo Finance から取り、取れないときは ExchangeRate-API を使います。
 - 価格と為替は、起動時と「価格を更新」でまとめて取得します（間隔は最短15分）。取れなかったときは最後に取れた値を使い、7日より古ければ注意に出します。
+  取れなかった理由（回数制限・接続できない・見つからない銘柄）は、銘柄名つきで表示します。
 - 価格はどれもリアルタイムではなく、参考値です。yfinance は Yahoo Finance の非公式ライブラリで、データは個人利用が前提です。
 - CoinGecko はキーなしで使えます。取得が不安定なときは、無料の Demo キーを「設定」に入れてください。
-- 積立は銘柄ごとに「毎月◯円・◯日・口座から／カード払い」を設定します。積立を記録すると、最新の価格で買える数量を計算します。
+- 積立は銘柄ごとに「毎月◯円・◯日・口座から／カード払い」を設定します。積立を記録すると、最新の価格で買える数量を計算します（株は1株単位で、積立額で買える分だけ）。
 
 ## データの置き場所
 
@@ -125,8 +127,8 @@ python3 -m venv ~/.venvs/clear
 - データファイルの形式は SQLite です。形式の版をファイルの中に記録しており、古い形式は開くときに新しい形式へ移行します。
   旧版（Payback Management）のファイルを直接開こうとした場合は、取り込み（コピー）を案内します。
 - 通信するのは次の取得元だけです: 為替は Yahoo Finance と [ExchangeRate-API](https://www.exchangerate-api.com/)（予備）、
-  株・貴金属は Yahoo Finance、仮想通貨は [CoinGecko](https://www.coingecko.com/) と [bitFlyer](https://bitflyer.com/)（使う場合）。
-  送るのは銘柄のコードだけで、残高などの個人のデータは送りません。
+  株・貴金属は Yahoo Finance、仮想通貨は [CoinGecko](https://www.coingecko.com/)、[Coinbase](https://www.coinbase.com/)（予備）、
+  [bitFlyer](https://bitflyer.com/)（予備、または選んだ場合）。送るのは銘柄のコードだけで、残高などの個人のデータは送りません。
 
 ## 開発
 
@@ -140,13 +142,14 @@ python3 -m pytest
 | `launch.py` | 起動スクリプト |
 | `clear/engine.py` | 計算エンジン（返済予定・完済・年会費・期日・月次締め・見通し）。画面に依存せず、テストで検算します |
 | `clear/invest.py` | 投資の評価・売買・NISA の枠 |
-| `clear/market.py` | 価格と為替の取得（yfinance・CoinGecko・bitFlyer） |
+| `clear/market.py` | 価格と為替の取得（取得元ごとの予備つき: yfinance・Yahoo Finance・ExchangeRate-API・CoinGecko・Coinbase・bitFlyer） |
 | `clear/jpcal.py` | 銀行の営業日（土日祝・年末年始） |
 | `clear/db.py`, `clear/repo.py` | SQLite の読み書き、旧版からの移行 |
 | `clear/store.py` | 画面とデータの橋渡し（ファイル・為替・価格・バックアップ） |
 | `clear/page_*.py` | 6つの画面（ホーム・借入とカード・毎月の収支・投資・計画・データと設定） |
 | `clear/dialogs.py`, `clear/dialogs_invest.py`, `clear/close_wizard.py`, `clear/welcome.py` | 入力画面・月次締め・初回起動 |
 | `clear/i18n.py`, `clear/theme.py` | 表示の文言（日本語・英語）、テーマ |
+| `clear/assets/` | アイコン（SVG が元。`scripts/make_icons.py` で PNG・ICO・ICNS を作ります） |
 | `tests/` | pytest（架空のデータだけを使い、通信もしません） |
 
 個人のデータ（.db、バックアップ、ログ）はリポジトリに含めません（`.gitignore` で除外）。
@@ -172,9 +175,9 @@ with one net-worth outlook. It succeeds Payback Management 3.x.
 - **Month-end close** – a three-step wizard confirms last month's payments, adds a month's interest to
   unpaid debts and carries savings over. A backup is taken first and the close can be undone.
 - **Annual card fees** with a billing month; the paid mark resets every year and the fee is part of the plan.
-- **Investments** – shares and ETFs, crypto-assets, precious metals and hand-valued assets, valued at market prices
-  (Yahoo Finance via yfinance, CoinGecko, optional bitFlyer). Allocation, trades with moving-average cost, monthly
-  contributions and NISA limits.
+- **Investments** – shares and ETFs, crypto-assets, precious metals and hand-valued assets, valued at market prices.
+  Every kind of price has fallbacks: yfinance → Yahoo Finance directly (→ ExchangeRate-API for exchange rates);
+  CoinGecko → Coinbase → bitFlyer. Allocation, trades with moving-average cost, monthly contributions and NISA limits.
 - **Net worth** (savings + investments − debts) on Home and in the plan; the actual figure is recorded at each close.
 - **Four currencies** (JPY, USD, CNY, SGD) with one display currency for all pages.
 - **Safe data** – data files live outside the app folder; automatic backups (latest 30 per file).

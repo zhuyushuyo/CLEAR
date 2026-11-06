@@ -7,6 +7,7 @@ import sys
 import traceback
 
 from PyQt6.QtCore import QTimer
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
 from . import i18n, paths, theme
@@ -31,10 +32,27 @@ def _install_excepthook(get_window) -> None:
     sys.excepthook = hook
 
 
+def _windows_taskbar_identity() -> None:
+    """Without its own id, Windows shows Python's icon in the taskbar instead of CLEAR's."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("YuZhu.CLEAR")
+    except Exception:  # pragma: no cover - cosmetic only
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _windows_taskbar_identity()
     app = QApplication(argv if argv is not None else sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
+    icon_file = paths.app_icon_file()
+    if icon_file.exists():
+        app.setWindowIcon(QIcon(str(icon_file)))  # windows, dialogs, the Dock and the taskbar
     app.setStyle("Fusion")
 
     cfg_path = paths.config_dir() / "config.json"

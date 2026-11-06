@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import QGridLayout, QHBoxLayout, QTabBar, QVBoxLayout
 from . import engine, invest, market
 from .chart import AllocationBar, UsageBar
 from .dialogs import DEFAULT_WIDTHS, TABLE_COLUMNS
-from .i18n import fmt_datetime, join_names, label_of, money, t
+from .i18n import fmt_datetime, join_names, label_of, lang, money, t
 from .models import HOLDING_KINDS
 from .shell import Page
 from .widgets import CENTER, RIGHT, Card, DataTable, KpiCard, button, item, label, set_tone
@@ -22,11 +22,8 @@ TABS = ("all",) + HOLDING_KINDS
 def fmt_qty(h, qty: float) -> str:
     if h.kind == "manual":
         return "—"
-    places = invest.QTY_DECIMALS.get(h.kind, 4)
-    text = f"{qty:,.{places}f}".rstrip("0").rstrip(".") if places else f"{qty:,.0f}"
-    if h.kind == "metal":
-        return f"{text} {h.unit}"
-    return text
+    text = invest.quantity_text(h.kind, qty)
+    return f"{text} {h.unit}" if h.kind == "metal" else text
 
 
 def signed(value: float, currency: str) -> str:
@@ -173,12 +170,12 @@ class InvestPage(Page):
             [(k, v, CYCLE[i % len(CYCLE)]) for i, (k, v) in enumerate(currencies)], cur)
 
     def _fill_status(self, st, folio) -> None:
-        needs_yahoo = any((invest.quote_ref(h) or ("", ""))[0] == "yahoo" for h in st.holdings)
         busy = self.store.market_busy
         self.refresh_btn.setEnabled(not busy and self.store.has_db)
         self.refresh_btn.setText(t("invest.refreshing") if busy else t("invest.refresh"))
-        if needs_yahoo and not market.yfinance_available():
-            self.status.setText(t("invest.no_yf"))
+        last = self.store.last_market
+        if last is not None and not last.ok and folio.missing:
+            self.status.setText(t("invest.status_failed", reason=self.failure_text(last, one_line=True)))
             set_tone(self.status, "warning")
             return
         set_tone(self.status, None)
@@ -285,16 +282,37 @@ class InvestPage(Page):
         elif not self.store.market_busy:
             self.win.notify(t("invest.fetch_nothing"))
 
-    def _market_done(self, ok: bool, message: str, quiet: bool) -> None:
+    def failure_text(self, result: market.MarketResult, one_line: bool = False) -> str:
+        """Why prices are missing, in words a person can act on."""
+        lines = []
+        for e in result.errors:
+            key = {"rate_limit": "market.err.rate_limit", "connection": "market.err.connection"}.get(
+                e.kind, "market.err.other")
+            lines.append(t(key, source=e.source, detail=e.detail))
+        if result.missing:
+            codes = set(result.missing)
+            names = []
+            for h in self.store.state().holdings:
+                ref = invest.quote_ref(h)
+                code = ref[1].split("@")[0] if ref else ""
+                if code in codes:
+                    names.append(f"{h.label}（{code}）" if lang() == "ja" else f"{h.label} ({code})")
+            # with a source down the codes are probably fine; otherwise the sources did not know them
+            key = "market.err.missing" if result.errors else "market.err.unknown_codes"
+            lines.append(t(key, names=join_names(names or sorted(codes))))
+        return ("  " if one_line else "\n").join(lines)
+
+    def _market_done(self, result: market.MarketResult, quiet: bool) -> None:
         self.refresh_btn.setEnabled(True)
         self.refresh_btn.setText(t("invest.refresh"))
         if not self.isVisible():
             return
-        if quiet and ok:
+        if result.ok:
+            if not quiet:
+                self.win.notify(t("invest.fetched"))
             return
-        if ok:
-            self.win.notify(t("invest.fetched"))
-        elif quiet:
-            self.win.notify(t("invest.fetch_failed", error=message).replace("\n", " "))
+        text = t("invest.fetch_failed", error=self.failure_text(result))
+        if quiet:
+            self.win.notify(text.replace("\n", " "))
         else:
-            self.win.notify(t("invest.fetch_failed", error=message), is_error=True)
+            self.win.notify(text, is_error=True)

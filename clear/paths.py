@@ -24,6 +24,16 @@ def app_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def asset(name: str) -> Path:
+    """A file shipped with the app (icons)."""
+    return Path(__file__).resolve().parent / "assets" / name
+
+
+def app_icon_file() -> Path:
+    """macOS Dock icons carry their own margin and shadow; elsewhere the icon fills its square."""
+    return asset("icon-mac.png" if sys.platform == "darwin" else "icon.png")
+
+
 def config_dir() -> Path:
     override = os.environ.get("CLEAR_CONFIG_DIR")
     if override:

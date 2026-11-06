@@ -47,7 +47,7 @@ class MarketWorker(QThread):
             result = market.refresh(self.request)
         except Exception as exc:  # pragma: no cover - refresh() already guards each source
             result = market.MarketResult(fetched_at=market.now_text())
-            result.errors.append(str(exc))
+            result.errors.append(market.classify("CLEAR", exc))
         self.done.emit(result)
 
 
@@ -72,7 +72,7 @@ class Store(QObject):
     changed = pyqtSignal()          # data in the open file changed (or another file was opened)
     view_changed = pyqtSignal()     # display currency / rates changed
     rates_status = pyqtSignal(bool, str)  # (success, message) after a fetch
-    market_status = pyqtSignal(bool, str, bool)  # (all prices arrived, message, quiet) after a refresh
+    market_status = pyqtSignal(object, bool)  # (market.MarketResult, quiet) after a refresh
 
     def __init__(self, cfg: AppConfig, cfg_path: Path):
         super().__init__()
@@ -84,6 +84,7 @@ class Store(QObject):
         self._worker: RateWorker | None = None
         self._market_worker: MarketWorker | None = None
         self._market_started: datetime | None = None
+        self.last_market: market.MarketResult | None = None   # the latest price refresh, for the page's status
         self.data_dir = Path(cfg.data_dir) if cfg.data_dir else paths.default_data_dir()
 
     # ---- config ------------------------------------------------------------------------------
@@ -159,13 +160,15 @@ class Store(QObject):
                 continue
             source, symbol = ref
             if source == "yahoo":
-                quote_cur = "USD" if h.kind == "metal" else (h.quote_currency or h.currency)
+                quote_cur = "USD" if h.kind == "metal" else (
+                    invest.quote_currency_for(symbol, h.quote_currency) or h.currency)
                 req.yahoo[symbol] = quote_cur
                 code, _div = market.normalize_currency(quote_cur)
                 if code and code not in CURRENCIES:
                     extra.add(code)
             elif source == "coingecko":
-                req.coingecko.setdefault(h.currency.lower(), set()).add(h.symbol)
+                coin, vs = symbol.split("@", 1)
+                req.coingecko.setdefault(vs, set()).add(coin)
             elif source == "bitflyer":
                 req.bitflyer.append(symbol)
             if h.currency not in CURRENCIES:
@@ -204,17 +207,16 @@ class Store(QObject):
         if result.fx:
             self.cfg.rates = {**self.cfg.rates, **result.fx, "USD": 1.0}
             self.cfg.rates_updated_at = datetime.now().replace(microsecond=0).isoformat()
-            self.cfg.rates_source = "yahoo"
+            self.cfg.rates_source = result.fx_source or "auto"
             self.save_config()
         elif self.cfg.auto_update_rates and rates.due_for_update(self.rates_updated_at()):
             self.fetch_rates(quiet=True)
-        log.info("market refresh: %d prices, fx %s, missing %s, errors %s", len(result.prices), sorted(result.fx),
-                 result.missing, result.errors)
-        ok = not result.errors and not result.missing
-        message = "\n".join(result.errors + ([", ".join(sorted(set(result.missing)))] if result.missing else []))
+        log.info("market refresh: %d prices, fx %s, missing %s, errors %s, sources %s", len(result.prices),
+                 sorted(result.fx), result.missing, [(e.source, e.kind, e.detail) for e in result.errors], result.used)
+        self.last_market = result
         self._touch(saved=False)
-        if not quiet or not ok:
-            self.market_status.emit(ok, message, quiet)
+        if not quiet or not result.ok:
+            self.market_status.emit(result, quiet)
 
     def prices_fetched_at(self) -> datetime | None:
         stamps = [invest.parse_time(p.fetched_at) for p in self.state().prices.values()]
@@ -525,15 +527,17 @@ class Store(QObject):
         price = 0.0
         if h.kind != "manual" and hv.unit_price:
             price = hv.unit_price
-            qty = invest.round_qty(h.kind, amount / price)
+            qty = invest.units_for(h.kind, amount, price)
         return ContribBuy(h.id, amount, qty, price, trade_date, h.contrib_method == "bank")
 
-    def record_contribution(self, h: Holding, trade_date: date | None = None) -> ContribBuy | None:
-        """Record this month's contribution at the latest price. None (nothing recorded) when a priced
-        holding has no price yet, since the quantity bought cannot be worked out."""
+    def record_contribution(self, h: Holding, trade_date: date | None = None) -> ContribBuy:
+        """Record this month's contribution at the latest price and return what it bought.
+
+        Nothing is written when a priced holding would get no units: there is no price yet
+        (price 0), or the amount is less than one share (quantity 0 at a known price)."""
         buy = self.contribution_buy(h, trade_date or self.today())
         if h.kind != "manual" and buy.quantity <= 0:
-            return None
+            return buy
         self._need().record_trade(h.id, "buy", buy.trade_date, quantity=buy.quantity, price=buy.price,
                                   amount=buy.amount, is_contrib=True, cash_effect=buy.cash_effect,
                                   note="contribution")

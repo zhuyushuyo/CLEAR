@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
-from PyQt6.QtCore import QDate, QLocale, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QFontMetrics, QIcon
-from PyQt6.QtWidgets import (QAbstractItemView, QComboBox, QDateEdit, QDoubleSpinBox, QFrame, QHBoxLayout,
-                             QHeaderView, QLabel, QMessageBox, QPushButton, QSizePolicy, QTableWidget,
-                             QTableWidgetItem, QVBoxLayout, QWidget)
+from PyQt6.QtCore import QDate, QLocale, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QIcon, QTextCharFormat
+from PyQt6.QtWidgets import (QAbstractItemView, QCalendarWidget, QComboBox, QDateEdit, QDoubleSpinBox, QFrame,
+                             QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton, QSizePolicy, QTableWidget,
+                             QTableWidgetItem, QToolButton, QVBoxLayout, QWidget)
 
-from . import theme
-from .i18n import t
+from . import jpcal, theme
+from .i18n import lang, t
 from .money import CURRENCIES, decimals
 
 try:  # qtawesome is optional: the app still works without icons
@@ -252,10 +252,62 @@ class CurrencyCombo(QComboBox):
         self.setMaximumWidth(90)
 
 
+def _text_format(color: str) -> QTextCharFormat:
+    fmt = QTextCharFormat()
+    fmt.setForeground(QColor(color))
+    return fmt
+
+
+class Calendar(QCalendarWidget):
+    """The date picker. Every day number fits its cell; Saturdays are blue, Sundays and bank holidays
+    red, days of the next and previous month faint; the month arrows follow the theme (Fusion's own
+    arrows disappear on a dark background)."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        tk = theme.current()
+        self.setGridVisible(False)
+        self.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+        self.setHorizontalHeaderFormat(QCalendarWidget.HorizontalHeaderFormat.ShortDayNames)
+        self.setFirstDayOfWeek(Qt.DayOfWeek.Sunday)
+        if lang() == "ja":  # day and month names in the app's language, not the system's
+            self.setLocale(QLocale(QLocale.Language.Japanese, QLocale.Country.Japan))
+        else:
+            self.setLocale(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
+        self.setMinimumSize(308, 236)
+        for name, glyph in (("qt_calendar_prevmonth", "fa5s.chevron-left"),
+                            ("qt_calendar_nextmonth", "fa5s.chevron-right")):
+            btn = self.findChild(QToolButton, name)
+            if btn is not None:
+                btn.setIcon(icon(glyph, tk.text))
+                btn.setIconSize(QSize(12, 12))
+        head = _text_format(tk.text_muted)
+        head.setBackground(QColor(tk.surface))
+        self.setHeaderTextFormat(head)
+        for day in (Qt.DayOfWeek.Monday, Qt.DayOfWeek.Tuesday, Qt.DayOfWeek.Wednesday, Qt.DayOfWeek.Thursday,
+                    Qt.DayOfWeek.Friday):
+            self.setWeekdayTextFormat(day, _text_format(tk.text))
+        self.setWeekdayTextFormat(Qt.DayOfWeek.Saturday, _text_format(tk.accent))
+        self.setWeekdayTextFormat(Qt.DayOfWeek.Sunday, _text_format(tk.critical))
+        self.currentPageChanged.connect(self._mark_holidays)
+        self._mark_holidays(self.yearShown(), self.monthShown())
+
+    def _mark_holidays(self, year: int, month: int) -> None:
+        """Weekdays the banks are closed (national holidays, 31 Dec - 3 Jan) in red."""
+        self.setDateTextFormat(QDate(), QTextCharFormat())  # forget the previous month's marks
+        red = _text_format(theme.current().critical)
+        d = date(year, month, 1) - timedelta(days=7)
+        for _ in range(52):
+            if d.weekday() < 5 and jpcal.is_bank_holiday(d):
+                self.setDateTextFormat(QDate(d.year, d.month, d.day), red)
+            d += timedelta(days=1)
+
+
 class DateField(QDateEdit):
     def __init__(self, value: date | None = None, parent: QWidget | None = None):
         super().__init__(parent)
         self.setCalendarPopup(True)
+        self.setCalendarWidget(Calendar())
         self.setDisplayFormat("yyyy-MM-dd")
         self.set_date(value or date.today())
 

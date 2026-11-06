@@ -12,14 +12,25 @@ TIMEOUT = 8.0
 STALE_DAYS = 7
 
 
-def fetch_rates(timeout: float = TIMEOUT) -> dict[str, float]:
-    """Units of each supported currency per 1 USD. Raises on any network/format problem."""
+def fetch_table(timeout: float = TIMEOUT) -> dict[str, float]:
+    """Every currency ExchangeRate-API knows, in units per 1 USD. Raises on any network/format problem."""
     import requests  # imported lazily: only needed when updating
 
     resp = requests.get(API_URL, timeout=timeout, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
     resp.raise_for_status()
-    data = resp.json()
-    raw = data.get("rates") or {}
+    table = {}
+    for code, value in ((resp.json() or {}).get("rates") or {}).items():
+        try:
+            if float(value) > 0:
+                table[str(code).upper()] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return table
+
+
+def fetch_rates(timeout: float = TIMEOUT) -> dict[str, float]:
+    """Units of each supported currency per 1 USD. Raises on any network/format problem."""
+    raw = fetch_table(timeout)
     out = {"USD": 1.0}
     for cur in CURRENCIES:
         if cur == "USD":

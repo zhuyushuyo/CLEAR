@@ -7,6 +7,8 @@ shares, …) and converted with the app's rates (units per 1 USD).
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
@@ -16,7 +18,71 @@ from .money import convert, round_money
 TROY_OUNCE_G = 31.1034768
 METAL_TICKERS = {"gold": "GC=F", "silver": "SI=F", "platinum": "PL=F", "palladium": "PA=F"}
 OUNCES_PER_UNIT = {"oz": 1.0, "g": 1.0 / TROY_OUNCE_G, "kg": 1000.0 / TROY_OUNCE_G}
-QTY_DECIMALS = {"stock": 4, "crypto": 8, "metal": 4, "manual": 0}
+QTY_DECIMALS = {"stock": 0, "crypto": 8, "metal": 4, "manual": 0}   # shares are whole numbers
+SHOW_DECIMALS = {"stock": 4, "crypto": 8, "metal": 4, "manual": 0}  # enough for any quantity already held
+
+# Yahoo Finance exchange suffix -> currency of the quote.
+SUFFIX_CURRENCY = {
+    ".T": "JPY", ".SS": "CNY", ".SZ": "CNY", ".SI": "SGD", ".HK": "HKD", ".L": "GBp", ".DE": "EUR", ".F": "EUR",
+    ".PA": "EUR", ".AS": "EUR", ".MI": "EUR", ".MC": "EUR", ".TO": "CAD", ".AX": "AUD", ".KS": "KRW", ".TW": "TWD",
+}
+TSE_CODE = re.compile(r"^\d[0-9A-Z]\d[0-9A-Z]$")   # Tokyo Stock Exchange codes: 7203, 130A
+
+# Tickers people type for crypto-assets -> CoinGecko ids.
+CRYPTO_IDS = {
+    "BTC": "bitcoin", "ETH": "ethereum", "XRP": "ripple", "SOL": "solana", "ADA": "cardano", "DOGE": "dogecoin",
+    "LTC": "litecoin", "DOT": "polkadot", "XLM": "stellar", "LINK": "chainlink", "AVAX": "avalanche-2",
+    "TRX": "tron", "BNB": "binancecoin", "BCH": "bitcoin-cash", "ETC": "ethereum-classic", "ATOM": "cosmos",
+    "SHIB": "shiba-inu", "MONA": "monacoin", "USDT": "tether", "USDC": "usd-coin", "TON": "the-open-network",
+    "NEAR": "near", "UNI": "uniswap", "XTZ": "tezos", "XEM": "nem", "XYM": "symbol", "IOST": "iostoken",
+    "ENJ": "enjincoin", "QTUM": "qtum", "BAT": "basic-attention-token", "SAND": "the-sandbox",
+    "MANA": "decentraland", "APT": "aptos", "SUI": "sui", "ARB": "arbitrum", "OP": "optimism",
+    "POL": "polygon-ecosystem-token", "FIL": "filecoin", "ALGO": "algorand", "HBAR": "hedera-hashgraph",
+}
+COIN_TICKERS = {coin: ticker for ticker, coin in CRYPTO_IDS.items()}
+
+
+def yahoo_symbol(symbol: str) -> str:
+    """Yahoo's form of a share code: upper case, and a Tokyo code (7203, 130A) gets ".T"."""
+    s = (symbol or "").strip().upper()
+    return f"{s}.T" if TSE_CODE.match(s) else s
+
+
+def quote_currency_for(symbol: str, known: str = "") -> str:
+    """Currency of a Yahoo quote: from the exchange suffix, else what a lookup said, else USD for a plain
+    US ticker ("" when it cannot be told)."""
+    sym = yahoo_symbol(symbol)
+    for suffix, cur in SUFFIX_CURRENCY.items():
+        if sym.endswith(suffix.upper()):
+            return cur
+    if known:
+        return known
+    if not sym:
+        return ""
+    if sym.endswith("=F"):
+        return "USD"
+    return "USD" if "." not in sym and not sym.startswith("^") else ""
+
+
+def coingecko_id(symbol: str) -> str:
+    """CoinGecko's id for what was typed: "BTC" or "btc" -> "bitcoin"; an id is kept as it is."""
+    s = (symbol or "").strip()
+    return CRYPTO_IDS.get(s.upper(), s.lower())
+
+
+def bitflyer_product(symbol: str) -> str:
+    """bitFlyer's product code: "btc" -> "BTC_JPY"."""
+    s = (symbol or "").strip().upper()
+    return s if "_" in s or not s else f"{s}_JPY"
+
+
+def quantity_text(kind: str, quantity: float) -> str:
+    """A quantity without trailing zeros: 100, 0.052, 120.5."""
+    places = SHOW_DECIMALS.get(kind, 4)
+    text = f"{quantity:,.{places}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
 
 # NISA (from 2024): yearly limits per frame and the lifetime limit (book value), in yen.
 NISA_YEAR_LIMIT = {"nisa_tsumitate": 1_200_000, "nisa_growth": 2_400_000}
@@ -37,10 +103,10 @@ def quote_ref(h: Holding) -> tuple[str, str] | None:
     if not h.symbol:
         return None
     if h.price_source == "coingecko":
-        return ("coingecko", f"{h.symbol}@{h.currency.lower()}")
+        return ("coingecko", f"{coingecko_id(h.symbol)}@{h.currency.lower()}")
     if h.price_source == "bitflyer":
-        return ("bitflyer", h.symbol.upper())
-    return ("yahoo", h.symbol)
+        return ("bitflyer", bitflyer_product(h.symbol))
+    return ("yahoo", yahoo_symbol(h.symbol))
 
 
 def parse_time(text: str | None) -> datetime | None:
@@ -207,6 +273,14 @@ def apply_trade(qty: float, avg: float, kind: str, quantity: float = 0.0, price:
 
 def round_qty(kind: str, quantity: float) -> float:
     return round(float(quantity), QTY_DECIMALS.get(kind, 8))
+
+
+def units_for(kind: str, amount: float, price: float) -> float:
+    """What an amount buys at a price, rounded down to what can be held (whole shares)."""
+    if price <= 0 or amount <= 0:
+        return 0.0
+    factor = 10 ** QTY_DECIMALS.get(kind, 8)
+    return math.floor(amount / price * factor + 1e-9) / factor
 
 
 # ---------------------------------------------------------------------------

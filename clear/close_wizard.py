@@ -147,6 +147,12 @@ class MonthCloseDialog(QDialog):
             return None
         return invest.value_holding(h, self.prices, self.rates, h.currency).unit_price
 
+    def _units(self, h, amount: float) -> float:
+        """Units a contribution of `amount` (in its own currency) buys at the latest price."""
+        price = self._unit_price(h.id) or 0.0
+        value = round_money(convert(amount, h.contrib_currency, h.currency, self.rates), h.currency)
+        return invest.units_for(h.kind, value, price)
+
     def _checked(self, row: int) -> bool:
         it = self.table.item(row, 0)
         return bool(it and it.checkState() == Qt.CheckState.Checked)
@@ -169,6 +175,8 @@ class MonthCloseDialog(QDialog):
                     text, tone = t("close.contrib_card"), "text_muted"
                 elif h is not None and h.kind != "manual" and not self._unit_price(it.target_id):
                     text, tone = t("close.no_price"), "warning"
+                elif h is not None and h.kind != "manual" and spin is not None and not self._units(h, spin.value()):
+                    text, tone = t("close.too_small"), "warning"
                 else:
                     text, tone = "", None
             elif self._checked(r):
@@ -293,7 +301,7 @@ class MonthCloseDialog(QDialog):
                 if ch.pay and ch.amount > 0 and h is not None:
                     amount = round_money(convert(ch.amount, h.contrib_currency, h.currency, self.rates), h.currency)
                     price = self._unit_price(h.id) or 0.0
-                    qty = invest.round_qty(h.kind, amount / price) if price else 0.0
+                    qty = invest.units_for(h.kind, amount, price)
                     if h.kind == "manual" or qty > 0:   # without a price the units are unknown: not written
                         plan.contrib_buys.append(ContribBuy(h.id, amount, qty, price, it.due,
                                                             h.contrib_method == "bank"))

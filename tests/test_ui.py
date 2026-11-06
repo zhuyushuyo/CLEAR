@@ -235,7 +235,7 @@ def test_investments_page_dialogs_and_contributions(env, app, monkeypatch):
     monkeypatch.setattr(main_window, "info", lambda _w, text, _title=None: shown.append(text))
     voo = store.add_holding(Holding(kind="stock", symbol="VOO", name="S&P 500 ETF", account="nisa_growth",
                                     quantity=12, avg_cost=420, currency="USD", quote_currency="USD",
-                                    contrib_amount=30000, contrib_currency="JPY", contrib_day=10))
+                                    contrib_amount=100000, contrib_currency="JPY", contrib_day=10))
     gold = store.add_holding(Holding(kind="metal", symbol="gold", name="Gold", unit="g", quantity=100,
                                      avg_cost=9800, currency="JPY", adjust_pct=3.0))
     fund = store.add_holding(Holding(kind="manual", name="Index fund", account="nisa_tsumitate", quantity=1,
@@ -244,9 +244,12 @@ def test_investments_page_dialogs_and_contributions(env, app, monkeypatch):
                                      contrib_method="card"))
     new = store.add_holding(Holding(kind="stock", symbol="NEW1", name="No price yet", quantity=1, avg_cost=10,
                                     currency="USD", contrib_amount=10000, contrib_currency="JPY", contrib_day=10))
+    dear = store.add_holding(Holding(kind="stock", symbol="7974", name="Dear share", quantity=100, avg_cost=8000,
+                                     currency="JPY", contrib_amount=5000, contrib_currency="JPY", contrib_day=10))
     stamp = "2026-11-06T09:00:00"
     store.repo.save_prices([Price("yahoo", "VOO", 560.0, "USD", 557.0, stamp),
-                            Price("yahoo", "GC=F", 2650.0, "USD", 2640.0, stamp)])
+                            Price("yahoo", "GC=F", 2650.0, "USD", 2640.0, stamp),
+                            Price("yahoo", "7974.T", 9000.0, "JPY", 8900.0, stamp)])
     store._touch(saved=False)
 
     win = MainWindow(store)
@@ -254,22 +257,35 @@ def test_investments_page_dialogs_and_contributions(env, app, monkeypatch):
     page = next(p for p in win.pages if isinstance(p, InvestPage))
     win.navigate(win.pages.index(page))
     app.processEvents()
-    assert page.table.rowCount() == 4 and page.nisa_card.isVisible()
+    assert page.table.rowCount() == 5 and page.nisa_card.isVisible()
+    shares = {page.table.item(r, 0).text(): page.table.item(r, 3).text() for r in range(page.table.rowCount())}
+    assert shares["S&P 500 ETF"] == "12" and shares["Dear share"] == "100"     # whole numbers, no ".0000"
     assert all(bar.rows for bar in page.alloc_bars.values())
     page.tabs.setCurrentIndex(3)                       # precious metals only
     assert page.table.rowCount() == 1
 
-    # a contribution buys at the latest price; without a price nothing is written
+    # a contribution buys whole shares at the latest price; without a price, or below one share, nothing is written
     win.toggle_paid("contrib", voo.id, True, voo.label, 0)
     tr = store.repo.trades(voo.id)
-    assert len(tr) == 1 and tr[0].is_contrib and tr[0].quantity == pytest.approx(200 / 560, abs=1e-4)
+    assert len(tr) == 1 and tr[0].is_contrib and tr[0].quantity == 1 and tr[0].amount == 560   # $666 buys 1
     win.toggle_paid("contrib", new.id, True, new.label, 0)
-    assert store.repo.trades(new.id) == [] and shown
+    assert store.repo.trades(new.id) == [] and "価格" in shown[-1]
+    win.toggle_paid("contrib", dear.id, True, dear.label, 0)
+    assert store.repo.trades(dear.id) == [] and "9,000" in shown[-1]
     win.toggle_paid("contrib", fund.id, True, fund.label, 0)
     assert next(h for h in store.state().holdings if h.id == fund.id).manual_price == 1_250_000
     win.toggle_paid("contrib", voo.id, False, voo.label, 0)
     assert store.repo.trades(voo.id) == []
 
+    tokyo = HoldingDialog(win, store, dear, "JPY")
+    assert tokyo.qty.text() == "100" and tokyo.qty.decimals() == 0
+    assert tokyo.quote_info.text() == ""                       # priced in yen like the holding: nothing to say
+    assert tokyo.result_holding().symbol == "7974.T" and tokyo.result_holding().quote_currency == "JPY"
+    tokyo.symbol.setText("6758")
+    tokyo.symbol.editingFinished.emit()
+    assert tokyo.symbol.text() == "6758.T"
+    us_in_yen = HoldingDialog(win, store, Holding(**{**voo.__dict__, "currency": "JPY"}), "JPY")
+    assert "USD" in us_in_yen.quote_info.text() and "JPY" in us_in_yen.quote_info.text()
     for h in (None, voo, gold, fund):
         dlg = HoldingDialog(win, store, h, "JPY")
         dlg.show()
@@ -292,3 +308,39 @@ def test_investments_page_dialogs_and_contributions(env, app, monkeypatch):
     win.navigate(0)
     app.processEvents()
     win.close()
+
+
+def test_price_requests_use_the_codes_people_mean(env):
+    """A Tokyo code typed without ".T", or a coin typed as its ticker, still gets its price (4.1.0 data too)."""
+    store, legacy = env
+    store.import_legacy(legacy)
+    store.add_holding(Holding(kind="stock", symbol="7203", name="Toyota", quantity=100, currency="JPY",
+                              quote_currency="USD"))                   # 4.1.0 guessed USD for a bare code
+    store.add_holding(Holding(kind="crypto", symbol="BTC", name="Bitcoin", quantity=0.05, currency="JPY",
+                              price_source="coingecko"))
+    store.add_holding(Holding(kind="metal", symbol="gold", name="Gold", unit="g", quantity=10, currency="JPY"))
+    req = store.market_request()
+    assert req.yahoo == {"7203.T": "JPY", "GC=F": "USD"}
+    assert req.coingecko == {"jpy": {"bitcoin"}}
+    assert {"JPY", "CNY", "SGD"} <= set(req.fx)
+
+
+def test_date_picker_colours_and_day_numbers(app):
+    from PyQt6.QtCore import QDate, Qt
+    from PyQt6.QtGui import QColor
+
+    from clear import jpcal, theme
+    from clear.widgets import Calendar, DateField
+
+    theme.apply(app, "dark")
+    field = DateField(date(2026, 11, 6))
+    cal = field.calendarWidget()
+    assert isinstance(cal, Calendar) and cal.firstDayOfWeek() == Qt.DayOfWeek.Sunday
+    tk = theme.current()
+    assert cal.weekdayTextFormat(Qt.DayOfWeek.Saturday).foreground().color().name() == QColor(tk.accent).name()
+    assert cal.weekdayTextFormat(Qt.DayOfWeek.Sunday).foreground().color().name() == QColor(tk.critical).name()
+    if jpcal.has_holiday_calendar():                       # Culture Day, a Tuesday
+        assert cal.dateTextFormat(QDate(2026, 11, 3)).foreground().color().name() == QColor(tk.critical).name()
+    # table cells elsewhere have side padding; the date grid must not, or "28" no longer fits its cell
+    assert "QCalendarWidget QTableView::item { padding: 0px; }" in app.styleSheet()
+    theme.apply(app, "light")

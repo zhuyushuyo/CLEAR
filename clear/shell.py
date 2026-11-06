@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
-from PyQt6.QtWidgets import (QButtonGroup, QComboBox, QFrame, QHBoxLayout, QPushButton, QScrollArea,
+from PyQt6.QtGui import QIcon
+from PyQt6.QtWidgets import (QButtonGroup, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
                              QVBoxLayout, QWidget)
 
 from . import paths, theme
@@ -58,7 +59,17 @@ class Sidebar(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 22, 14, 16)
         lay.setSpacing(4)
-        lay.addWidget(label(APP_NAME, "Brand"))
+        brand = QHBoxLayout()
+        brand.setSpacing(9)
+        logo_file = paths.asset("icon.png")
+        if logo_file.exists():
+            logo = QLabel()
+            logo.setObjectName("Logo")
+            logo.setPixmap(QIcon(str(logo_file)).pixmap(26, 26))
+            brand.addWidget(logo)
+        brand.addWidget(label(APP_NAME, "Brand"))
+        brand.addStretch(1)
+        lay.addLayout(brand)
         lay.addWidget(label(t("brand.sub"), "BrandSub"))
         lay.addSpacing(18)
         self.group = QButtonGroup(self)

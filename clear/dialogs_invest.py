@@ -15,30 +15,25 @@ from .money import CURRENCIES, decimals, fmt_number, round_money
 from .store import TaskWorker
 from .widgets import CurrencyCombo, DateField, DayCombo, MoneySpin, button, label, repolish
 
-# Exchange suffix -> currency, used when a code is typed without looking it up.
-SUFFIX_CURRENCY = {
-    ".T": "JPY", ".SS": "CNY", ".SZ": "CNY", ".SI": "SGD", ".HK": "HKD", ".L": "GBp", ".DE": "EUR", ".F": "EUR",
-    ".PA": "EUR", ".AS": "EUR", ".MI": "EUR", ".MC": "EUR", ".TO": "CAD", ".AX": "AUD", ".KS": "KRW", ".TW": "TWD",
-}
+class QtySpin(MoneySpin):
+    """A quantity: whole numbers for shares, no trailing zeros ("100", "0.052", "120.5")."""
 
+    def __init__(self, kind: str, value: float = 0.0, fraction: bool = False):
+        super().__init__("USD")
+        self.setSingleStep(1)
+        self.set_kind(kind, value, fraction)
 
-def guess_quote_currency(symbol: str) -> str:
-    sym = symbol.strip().upper()
-    if not sym:
-        return ""
-    if sym.endswith("=F"):
-        return "USD"
-    for suffix, cur in SUFFIX_CURRENCY.items():
-        if sym.endswith(suffix.upper()):
-            return cur
-    return "" if "." in sym else "USD"
+    def set_kind(self, kind: str, value: float | None = None, fraction: bool = False) -> None:
+        value = self.value() if value is None else value
+        places = invest.QTY_DECIMALS.get(kind, 4)
+        if places == 0 and (fraction or abs(value - round(value)) > 1e-9):
+            places = invest.SHOW_DECIMALS.get(kind, 4)  # a fractional holding from before stays exact
+        self.setDecimals(places)
+        self.setValue(value)
 
-
-def qty_spin(kind: str) -> MoneySpin:
-    spin = MoneySpin("USD")
-    spin.setDecimals(invest.QTY_DECIMALS.get(kind, 4))
-    spin.setSingleStep(1)
-    return spin
+    def textFromValue(self, value: float) -> str:  # noqa: N802 - Qt naming
+        text = super().textFromValue(value)
+        return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 def combo(prefix: str, codes, current: str) -> QComboBox:
@@ -80,8 +75,7 @@ class HoldingDialog(FormDialog):
         self.unit = combo("unit", METAL_UNITS, h.unit or "g")
         self.source = QComboBox()
         self.account = combo("acct", ACCOUNTS, h.account)
-        self.qty = qty_spin(h.kind)
-        self.qty.setValue(h.quantity)
+        self.qty = QtySpin(h.kind, h.quantity)
         self.currency = CurrencyCombo(h.currency)
         self.avg = MoneySpin(h.currency)
         self.avg.setValue(h.avg_cost)
@@ -169,7 +163,7 @@ class HoldingDialog(FormDialog):
     def _kind_changed(self) -> None:
         kind = self._kind()
         self._fill_sources()
-        self.qty.setDecimals(invest.QTY_DECIMALS.get(kind, 4))
+        self.qty.set_kind(kind)
         self.results.hide()
         if kind == "metal" and not self.name.text().strip():
             self.name.setText(label_of("metal", self.metal.currentData()))
@@ -218,9 +212,7 @@ class HoldingDialog(FormDialog):
             self.quote_info.setText(t("hold.bitflyer_hint"))
         else:
             self.currency.setEnabled(True)
-            quote = self._quote()
-            self.quote_info.setText(t("hold.quote_info", cur=quote) if quote and kind == "stock"
-                                    and source == "yahoo" else "")
+            self.quote_info.setText(self._quote_text(kind, source))
         self._update_preview()
 
     def _set_label(self, widget: QWidget, text: str) -> None:
@@ -234,22 +226,42 @@ class HoldingDialog(FormDialog):
             return "USD"
         if self._kind() == "crypto":
             return "JPY" if self._source() == "bitflyer" else self.currency.currentText()
-        return self._quote_currency or guess_quote_currency(self.symbol.text())
+        return invest.quote_currency_for(self.symbol.text(), self._quote_currency)
+
+    def _quote_text(self, kind: str, source: str) -> str:
+        """Said only when the price comes in another currency than the holding's."""
+        cur = self.currency.currentText()
+        if kind == "metal" and source == "yahoo":
+            return t("hold.quote_info_metal", cur=cur)
+        if kind != "stock" or source != "yahoo":
+            return ""
+        quote = self._quote()
+        code, _div = market.normalize_currency(quote)
+        return t("hold.quote_info", quote=code, cur=cur) if code and code != cur else ""
 
     # ---- search ------------------------------------------------------------------------------------------
     def _symbol_typed(self) -> None:
-        if self._kind() == "stock":
-            self._quote_currency = ""
+        text = self.symbol.text().strip()
+        kind, source = self._kind(), self._source()
+        if kind == "stock" and source == "yahoo":
+            code = invest.yahoo_symbol(text)          # 7203 -> 7203.T
+            if code != text:
+                self.symbol.setText(code)
+            if code != (self.src.symbol if self.src else ""):
+                self._quote_currency = ""
             self._sync()
+        elif kind == "crypto" and source == "coingecko" and text:
+            coin = invest.coingecko_id(text)          # BTC -> bitcoin
+            if coin != text:
+                self.symbol.setText(coin)
+                if not self.name.text().strip():
+                    self.name.setText(text.upper())
 
     def _search(self) -> None:
         query = self.symbol.text().strip() or self.name.text().strip()
         if not query or (self._worker is not None and self._worker.isRunning()):
             return
         kind = self._kind()
-        if kind == "stock" and not market.yfinance_available():
-            self._show_results([], t("hold.no_yf_search"))
-            return
         key = self.store.cfg.coingecko_key.strip()
         fn = (lambda: market.search_yahoo(query)) if kind == "stock" else (lambda: market.search_coingecko(query, key))
         self.search_btn.setEnabled(False)
@@ -282,9 +294,9 @@ class HoldingDialog(FormDialog):
         if not self.name.text().strip() or self.src is None:
             self.name.setText(r["name"].split(" (")[0] if self._kind() == "crypto" else r["name"])
         self.results.hide()
-        if self._kind() == "stock" and market.yfinance_available():
+        if self._kind() == "stock":
             sym = r["symbol"]
-            self._quote_currency = guess_quote_currency(sym)
+            self._quote_currency = ""
             worker = TaskWorker(lambda: market.yahoo_lookup(sym), self)
             worker.ok.connect(self._looked_up)
             worker.failed.connect(lambda _m: self._sync())
@@ -338,9 +350,14 @@ class HoldingDialog(FormDialog):
             h.unit, h.adjust_pct = "", 0.0
             h.symbol = self.symbol.text().strip()
             if kind == "crypto":
-                h.symbol = h.symbol.lower() if source == "coingecko" else h.symbol.upper()
+                if source == "coingecko":
+                    h.symbol = invest.coingecko_id(h.symbol)
+                elif source == "bitflyer":
+                    h.symbol = invest.bitflyer_product(h.symbol)
                 h.quote_currency = "JPY" if source == "bitflyer" else h.currency
             else:
+                if source == "yahoo":
+                    h.symbol = invest.yahoo_symbol(h.symbol)
                 h.quote_currency = self._quote() if source == "yahoo" else ""
         return h
 
@@ -366,7 +383,7 @@ class HoldingDialog(FormDialog):
             self.fail(t("hold.err.symbol"), self.symbol)
             return False
         if kind == "crypto" and source == "bitflyer" and \
-                self.symbol.text().strip().upper() not in market.BITFLYER_PRODUCTS:
+                invest.bitflyer_product(self.symbol.text()) not in market.BITFLYER_PRODUCTS:
             self.fail(t("hold.bitflyer_hint"), self.symbol)
             return False
         if kind in ("manual",) or (kind in ("stock", "crypto") and source == "manual"):
@@ -392,7 +409,7 @@ class TradeDialog(FormDialog):
             key = f"trade.m.{code}" if manual and code in ("buy", "sell") else f"trade.{code}"
             self.kind.addItem(t(key), code)
         self.date = DateField(today)
-        self.qty = qty_spin(holding.kind)
+        self.qty = QtySpin(holding.kind, 0.0, fraction=abs(holding.quantity - round(holding.quantity)) > 1e-9)
         self.price = MoneySpin(holding.currency)
         if unit_price:
             self.price.setValue(round(unit_price, max(2, decimals(holding.currency))))
@@ -443,8 +460,7 @@ class TradeDialog(FormDialog):
         else:
             res = invest.apply_trade(h.quantity, h.avg_cost, code, self.qty.value(), self.price.value(),
                                      self.fee.value())
-            q = invest.QTY_DECIMALS.get(h.kind, 4)
-            qb, qa = f"{h.quantity:,.{q}f}".rstrip("0").rstrip("."), f"{res.qty_after:,.{q}f}".rstrip("0").rstrip(".")
+            qb, qa = invest.quantity_text(h.kind, h.quantity), invest.quantity_text(h.kind, res.qty_after)
             if code == "buy":
                 text = t("trade.preview.buy", amount=money(res.amount, cur), qb=qb, qa=qa,
                          ab=fmt_number(h.avg_cost, cur), aa=fmt_number(res.avg_after, cur))
@@ -465,7 +481,7 @@ class TradeDialog(FormDialog):
             self.fail(t("trade.err.qty"), self.qty)
             return False
         if code == "sell" and self.qty.value() > self.h.quantity + 1e-12:
-            self.fail(t("trade.err.sell_more", qty=f"{self.h.quantity:g}"), self.qty)
+            self.fail(t("trade.err.sell_more", qty=invest.quantity_text(self.h.kind, self.h.quantity)), self.qty)
             return False
         return True
 

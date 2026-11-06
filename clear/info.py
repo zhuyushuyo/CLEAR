@@ -2,7 +2,7 @@
 
 APP_NAME = "CLEAR"
 APP_FULL_NAME = "Cashflow, Loans, Expenses, Assets & Repayment"
-APP_VERSION = "4.1.0"
+APP_VERSION = "4.1.1"
 APP_AUTHOR = "Yu ZHU"
 LEGACY_APP_NAME = "Payback Management"
 REPO_URL = "https://github.com/zhuyushuyo/CLEAR"

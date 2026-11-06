@@ -238,24 +238,34 @@ def test_sales_and_purchases_of_the_month_move_savings():
 
 # ---- price sources (no network: fake responses) ----------------------------------------------------
 class FakeResponse:
-    def __init__(self, data):
+    def __init__(self, data, status_code: int = 200):
         self.data = data
+        self.status_code = status_code
 
     def raise_for_status(self):
-        pass
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
 
     def json(self):
         return self.data
 
 
 class FakeSession:
+    """Answers with fixed data, or with what a function returns (data, or a (data, status) pair)."""
+
     def __init__(self, data):
         self.data = data
         self.calls = []
 
     def get(self, url, **kw):
         self.calls.append((url, kw))
-        return FakeResponse(self.data(url, kw) if callable(self.data) else self.data)
+        out = self.data(url, kw) if callable(self.data) else self.data
+        return FakeResponse(*out) if isinstance(out, tuple) else FakeResponse(out)
+
+
+def chart_answer(price: float, closes: list, currency: str, name: str = "") -> dict:
+    return {"chart": {"result": [{"meta": {"currency": currency, "regularMarketPrice": price, "longName": name},
+                                  "indicators": {"quote": [{"close": closes}]}}], "error": None}}
 
 
 def test_coingecko_prices_and_previous_day():
@@ -280,14 +290,101 @@ def test_bitflyer_and_sub_unit_currencies():
     assert market.normalize_currency("usd") == ("USD", 1.0)
 
 
-def test_refresh_keeps_what_arrived(monkeypatch):
-    monkeypatch.setattr(market, "yfinance_available", lambda: False)
-    monkeypatch.setattr(market, "fetch_coingecko",
-                        lambda by_vs, key="", timeout=10.0: {("bitcoin", "jpy"): (15_000_000.0, None)})
-    req = market.MarketRequest(yahoo={"VOO": "USD"}, fx=["JPY"], coingecko={"jpy": {"bitcoin", "dogecoin"}})
+def test_yahoo_chart_api(monkeypatch):
+    monkeypatch.setattr(market.time, "sleep", lambda _s: None)
+
+    def answer(url, kw):
+        if "7203.T" in url:
+            return chart_answer(2890.0, [2850.0, 2860.0, None, 2890.0], "JPY", "Toyota Motor Corporation")
+        if "BP.L" in url:
+            return chart_answer(480.5, [470.0, 480.5], "GBp")
+        return {"chart": {"result": None, "error": {"code": "Not Found"}}}, 404
+
+    s = FakeSession(answer)
+    out = market.fetch_yahoo_chart(["7203.T", "BP.L", "NOPE"], session=s)
+    assert out == {"7203.T": (2890.0, 2860.0, "JPY"), "BP.L": (480.5, 470.0, "GBp")}
+    assert s.calls[0][1]["params"] == {"range": "5d", "interval": "1d"}
+    looked = market.yahoo_lookup("7203.T", session=s)
+    assert looked == {"symbol": "7203.T", "currency": "JPY", "price": 2890.0, "name": "Toyota Motor Corporation"}
+    with pytest.raises(LookupError):
+        market.yahoo_lookup("NOPE", session=s)
+    with pytest.raises(market.RateLimited):
+        market.fetch_yahoo_chart(["VOO"], session=FakeSession(lambda url, kw: ({}, 429)))
+    found = market.search_yahoo("toyota", session=FakeSession({"quotes": [
+        {"symbol": "7203.T", "shortname": "TOYOTA MOTOR CORP", "exchDisp": "Tokyo", "typeDisp": "Equity"}]}))
+    assert found == [{"symbol": "7203.T", "name": "TOYOTA MOTOR CORP", "exchange": "Tokyo", "kind": "Equity"}]
+
+
+def test_refresh_falls_back_source_by_source(monkeypatch):
+    from clear import rates
+
+    def broken_yfinance(*_a, **_k):
+        raise RuntimeError("yfinance broke")
+
+    monkeypatch.setattr(market, "yfinance_available", lambda: True)
+    monkeypatch.setattr(market, "fetch_yahoo", broken_yfinance)
+    monkeypatch.setattr(market, "fetch_yahoo_chart", lambda syms, timeout=10.0: {
+        s: v for s, v in {"VOO": (560.0, 557.0, "USD"), "JPY=X": (150.0, None, "JPY")}.items() if s in syms})
+    monkeypatch.setattr(rates, "fetch_table", lambda timeout=8.0: {"JPY": 151.0, "CNY": 7.1, "SGD": 1.3})
+
+    def gecko_limited(*_a, **_k):
+        raise market.RateLimited("CoinGecko")
+
+    monkeypatch.setattr(market, "fetch_coingecko", gecko_limited)
+    monkeypatch.setattr(market, "fetch_coinbase", lambda wanted, timeout=10.0: {
+        k: v for k, v in {("bitcoin", "jpy"): 15_000_000.0}.items() if k[0] in wanted.get(k[1], set())})
+    monkeypatch.setattr(market, "fetch_bitflyer", lambda products, timeout=10.0: {"XRP_JPY": 330.0})
+    req = market.MarketRequest(yahoo={"VOO": "USD", "NOPE": "USD"}, fx=["JPY", "CNY", "SGD"],
+                               coingecko={"jpy": {"bitcoin", "ripple", "dogecoin"}})
     res = market.refresh(req)
-    assert "yfinance" in res.errors and "VOO" in res.missing and "dogecoin" in res.missing
-    assert [(p.key, p.price) for p in res.prices] == [(price_key("coingecko", "bitcoin@jpy"), 15_000_000.0)]
+    prices = {p.key: p.price for p in res.prices}
+    assert prices == {price_key("yahoo", "VOO"): 560.0, price_key("coingecko", "bitcoin@jpy"): 15_000_000.0,
+                      price_key("coingecko", "ripple@jpy"): 330.0}
+    assert res.fx == {"JPY": 150.0, "CNY": 7.1, "SGD": 1.3} and res.fx_source == "yahoo"
+    assert sorted(res.missing) == ["NOPE", "dogecoin"]
+    assert [(e.source, e.kind) for e in res.errors] == [("Yahoo Finance", "error"), ("CoinGecko", "rate_limit")]
+    assert {"yahoo-chart", "exchangerate-api", "coinbase", "bitflyer"} <= set(res.used) and not res.ok
+
+
+def test_refresh_without_yfinance_and_nothing_missing(monkeypatch):
+    monkeypatch.setattr(market, "yfinance_available", lambda: False)
+    monkeypatch.setattr(market, "fetch_yahoo_chart", lambda syms, timeout=10.0: {s: (100.0, 99.0, "USD") for s in syms})
+    res = market.refresh(market.MarketRequest(yahoo={"VOO": "USD", "GC=F": "USD"}))
+    assert res.ok and res.errors == [] and res.used == ["yahoo-chart"] and len(res.prices) == 2
+
+
+def test_errors_people_can_act_on():
+    import requests
+
+    assert market.classify("X", market.RateLimited("X")).kind == "rate_limit"
+    assert market.classify("X", RuntimeError("429 Client Error: Too Many Requests")).kind == "rate_limit"
+    assert market.classify("X", requests.exceptions.ConnectionError("Failed to establish a new connection")).kind \
+        == "connection"
+    assert market.classify("X", requests.exceptions.ReadTimeout("read timed out")).kind == "connection"
+    assert market.classify("X", ValueError("bad JSON")) == market.SourceError("X", "error", "bad JSON")
+
+
+def test_codes_people_type_are_normalised():
+    assert invest.yahoo_symbol("7203") == "7203.T" and invest.yahoo_symbol("130a") == "130A.T"
+    assert invest.yahoo_symbol(" aapl ") == "AAPL" and invest.yahoo_symbol("7203.T") == "7203.T"
+    assert invest.quote_currency_for("7203", "USD") == "JPY"           # the exchange decides, not a bad guess
+    assert invest.quote_currency_for("VOO") == "USD" and invest.quote_currency_for("BP.L") == "GBp"
+    assert invest.quote_currency_for("^N225") == "" and invest.quote_currency_for("^N225", "JPY") == "JPY"
+    assert invest.coingecko_id("BTC") == "bitcoin" and invest.coingecko_id("bitcoin") == "bitcoin"
+    assert invest.bitflyer_product("xrp") == "XRP_JPY" and invest.bitflyer_product("BTC_JPY") == "BTC_JPY"
+    h = Holding(kind="stock", symbol="7203", currency="JPY")
+    assert invest.quote_ref(h) == ("yahoo", "7203.T")
+    btc = Holding(kind="crypto", symbol="BTC", currency="JPY", price_source="coingecko")
+    assert invest.quote_ref(btc) == ("coingecko", "bitcoin@jpy")
+
+
+def test_whole_shares():
+    assert invest.units_for("stock", 30000, 2890) == 10                     # rounded down, never more
+    assert invest.units_for("stock", 30000, 84000) == 0
+    assert invest.units_for("crypto", 30000, 15_000_000) == pytest.approx(0.002)
+    assert invest.units_for("metal", 10000, 13163) == pytest.approx(0.7597)
+    assert invest.quantity_text("stock", 100) == "100" and invest.quantity_text("stock", 1234.5) == "1,234.5"
+    assert invest.quantity_text("crypto", 0.052) == "0.052" and invest.quantity_text("metal", 120) == "120"
 
 
 def test_yahoo_frames_in_both_layouts():

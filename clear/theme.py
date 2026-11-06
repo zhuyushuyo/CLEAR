@@ -257,9 +257,19 @@ QComboBox QAbstractItemView {{ background: {t.surface}; color: {t.text}; border:
     selection-background-color: {t.selection}; selection-color: {t.selection_text}; outline: none; }}
 
 QTableWidget, QTableView, QListWidget {{ background: {t.surface}; alternate-background-color: {t.table_alt};
-    color: {t.text}; border: 1px solid {t.border}; border-radius: 10px; gridline-color: {t.grid};
+    border: 1px solid {t.border}; border-radius: 10px; gridline-color: {t.grid};
     selection-background-color: {t.selection}; selection-color: {t.selection_text}; outline: none; }}
 QTableWidget::item, QTableView::item {{ padding: 2px 8px; border: none; }}
+QCalendarWidget QWidget#qt_calendar_navigationbar {{ background: {t.surface_alt}; border-bottom: 1px solid {t.border}; }}
+QCalendarWidget QToolButton {{ color: {t.text}; background: transparent; border: none; border-radius: 6px;
+    padding: 4px 8px; font-weight: 600; }}
+QCalendarWidget QToolButton:hover {{ background: {t.selection}; }}
+QCalendarWidget QToolButton::menu-indicator {{ image: none; width: 0px; }}
+QCalendarWidget QSpinBox {{ background: {t.surface}; color: {t.text}; border: 1px solid {t.border_strong};
+    border-radius: 4px; padding: 2px 4px; selection-background-color: {t.accent}; selection-color: {t.on_accent}; }}
+QCalendarWidget QTableView {{ background: {t.surface}; border: none; border-radius: 0px;
+    selection-background-color: {t.accent}; selection-color: {t.on_accent}; outline: none; }}
+QCalendarWidget QTableView::item {{ padding: 0px; }}
 QListWidget::item {{ padding: 6px 8px; }}
 QHeaderView {{ background: transparent; border: none; }}
 QHeaderView::section {{ background: {t.header}; color: {t.text_muted}; border: none;

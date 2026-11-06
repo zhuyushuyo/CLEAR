@@ -476,9 +476,14 @@ class MainWindow(QMainWindow):
                 when = due if due <= self.store.today() else self.store.today()
                 result: list = []
                 if self.guard(lambda: result.append(self.store.record_contribution(h, when))):
-                    if result[0] is None:
-                        self.refresh()                    # the tick goes back
-                        info(self, t("invest.contrib_no_price"))
+                    buy = result[0]
+                    if h.kind != "manual" and buy.quantity <= 0:
+                        self.refresh()                    # nothing was written: the tick goes back
+                        if buy.price > 0:
+                            info(self, t("invest.contrib_too_small", name=h.label,
+                                         price=money(buy.price, h.currency)))
+                        else:
+                            info(self, t("invest.contrib_no_price"))
                     else:
                         self.notify(t("invest.contrib_done", name=h.label))
             else:
