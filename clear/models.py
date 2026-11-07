@@ -53,6 +53,7 @@ class Bill:
     sort_order: int = 0
     note: str = ""
     auto_debit: bool = True           # taken from the bank account automatically on the due date
+    start_period: str = ""            # "YYYY-MM" of the first payment: nothing is due before it ("" = no limit)
 
     @property
     def is_lump_sum(self) -> bool:
@@ -83,6 +84,7 @@ class LivingCost:
     payment_method: str = "Cash"      # see PAYMENT_METHODS
     created_date: date | None = None
     last_updated: date | None = None
+    start_period: str = ""            # "YYYY-MM" of the first payment: nothing is due before it ("" = no limit)
 
     @property
     def is_card(self) -> bool:

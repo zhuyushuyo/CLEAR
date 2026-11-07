@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from PyQt6.QtGui import QFont, QFontMetrics
 from PyQt6.QtWidgets import QComboBox, QHeaderView
 
 from . import engine
@@ -10,6 +11,9 @@ from .i18n import fmt_period, money, t
 from .money import convert, fmt_number
 from .shell import Page
 from .widgets import RIGHT, Card, DataTable, item, label
+
+CASH_NET, WORTH = 9, 10   # savings minus debt (without investments), net worth
+CELL_PADDING = 8          # left and right padding of cells and headings in the style sheet (theme.py)
 
 
 class PlanPage(Page):
@@ -30,11 +34,14 @@ class PlanPage(Page):
         self.card.actions.addWidget(self.months)
         self.table = DataTable("plan", [t(k) for k in TABLE_COLUMNS["plan"]])
         head = self.table.horizontalHeader()
-        head.setMinimumSectionSize(104)
+        head.setMinimumSectionSize(104)   # until the first refresh measures the texts
+        head.setStretchLastSection(False)  # every column stretches: the last one gets no extra minimum
         head.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         head.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         for col in range(1, self.table.columnCount()):
             self.table.horizontalHeaderItem(col).setTextAlignment(RIGHT)
+        self.table.horizontalHeaderItem(CASH_NET).setToolTip(t("plan.col.cash_net_tip"))
+        self.table.horizontalHeaderItem(WORTH).setToolTip(t("plan.col.worth_tip"))
         self.card.body.addWidget(self.table, 1)
         self.notes = label("", "Hint", wrap=True)
         self.card.body.addWidget(self.notes)
@@ -49,8 +56,8 @@ class PlanPage(Page):
         self.months.blockSignals(False)
         self.card.set_subtitle(t("plan.sub", cur=cur))
         hidden = set(self.store.cfg.hidden("plan"))
-        if not st.holdings:  # no investments: the two investment columns would only show zeros
-            hidden |= {4, 7}
+        if not st.holdings:  # no investments: zeros, and savings minus debt would equal net worth
+            hidden |= {4, 7, CASH_NET}
         self.table.apply_layout(hidden, None)
         rows = engine.simulate(st, n, rates, cur) if self.store.has_db else []
         tbl = self.table
@@ -67,8 +74,11 @@ class PlanPage(Page):
             tbl.setItem(r, 6, item(fmt_number(row.savings, cur), RIGHT, tone="critical" if row.savings < 0 else None))
             tbl.setItem(r, 7, item(fmt_number(row.invest, cur), RIGHT))
             tbl.setItem(r, 8, item(fmt_number(row.debt, cur), RIGHT, tone="text_muted"))
-            tbl.setItem(r, 9, item(fmt_number(row.net_worth, cur), RIGHT,
-                                   tone="critical" if row.net_worth < 0 else "accent", bold=True))
+            tbl.setItem(r, CASH_NET, item(fmt_number(row.cash_net, cur), RIGHT,
+                                          tone="critical" if row.cash_net < 0 else None))
+            tbl.setItem(r, WORTH, item(fmt_number(row.net_worth, cur), RIGHT,
+                                       tone="critical" if row.net_worth < 0 else "accent", bold=True))
+        self._fit_columns()
         notes = [t("plan.note_card_living")]
         if st.holdings:
             r_ = {k: f"{float(v):g}" for k, v in st.returns.items()}
@@ -81,6 +91,27 @@ class PlanPage(Page):
         if outside > 0:
             notes.append(t("plan.note_cards", amount=money(outside, cur)))
         self.notes.setText("  ".join(notes))
+
+    def _fit_columns(self) -> None:
+        """The columns share the width equally, but none gets narrower than its widest text: the
+        table scrolls sideways before a figure or a heading is cut off."""
+        tbl = self.table
+        head = tbl.horizontalHeader()
+        head_font = QFont(tbl.font())   # as the style sheet draws headings: 12 px, semi-bold
+        head_font.setPixelSize(12)
+        head_font.setWeight(QFont.Weight.DemiBold)
+        head_fm = QFontMetrics(head_font)
+        pad = 2 * CELL_PADDING + 4
+        need = 0
+        for col in range(1, tbl.columnCount()):
+            if tbl.isColumnHidden(col):
+                continue
+            need = max(need, head_fm.horizontalAdvance(tbl.horizontalHeaderItem(col).text()) + pad)
+            for row in range(tbl.rowCount()):
+                it = tbl.item(row, col)
+                if it is not None:
+                    need = max(need, QFontMetrics(it.font()).horizontalAdvance(it.text()) + pad)
+        head.setMinimumSectionSize(max(72, need))
 
     def _months_changed(self) -> None:
         if not self.store.has_db:

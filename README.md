@@ -5,7 +5,7 @@
 借入の返済、毎月の家計、投資を合わせて、純資産の見通しを管理するデスクトップアプリです。
 Payback Management 3.x（Personal Finance Manager Pro）の後継版です。
 
-- 版: 4.1.1
+- 版: 4.1.2
 - 開発: Yu ZHU
 - ライセンス: Apache License 2.0
 - English summary: [below](#english)
@@ -15,6 +15,9 @@ Payback Management 3.x（Personal Finance Manager Pro）の後継版です。
 - **返済の記録（台帳）**: 支払った額と日付を記録し、利息と元金に分けて残高を更新します。記録はあとから取り消せます。
 - **自動引き落とし**: 借入・生活費ごとに口座引き落としかどうかを設定できます。引き落とし日を過ぎた項目は赤い「超過」ではなく
   「記録待ち」と表示し、起動時にまとめて確認・記録できます。支払日が土日祝や年末年始なら、翌営業日を期日として数えます。
+- **今月の分と次の月の分**: 支払日を過ぎてから借入・生活費を編集すると、変更を「次回から」使うか「今月から」使うかを選べます。
+  「次回から」なら今月の分を済みとして記録するので、次の月の金額を先に入れても「記録待ち」になりません。
+  新しく登録するときは、初回の支払い（今月・来月・再来月）を選べます。
 - **月次締め**: 月が変わったら、先月の支払いの確認 → 貯蓄の繰り越し → 確定、の3ステップで締めます。未払いの借入には、その月の利息を残高に加えます。締める前に自動でバックアップを作り、取り消しもできます。
 - **完済の見通し**: 借入ごとに完済予定の年月と残りの利息を表示します。返済額が利息以下（利息割れ）の借入は警告します。
 - **カードの年会費**: 請求月と支払った年月を記録し、「11,000 ✓ 支払済 2026年3月」のように一目で分かる形で表示します。次の請求月に自動で「未払い」に戻り、計画の見通しにも入ります。
@@ -22,11 +25,12 @@ Payback Management 3.x（Personal Finance Manager Pro）の後継版です。
   時価から評価額・損益・前日比を計算します。資産配分（種類別・口座別・通貨別）、売買と配当の記録（移動平均の取得単価）、
   毎月の積立、NISA の枠（今年の残り枠と生涯投資枠）も扱います。
 - **純資産**: 貯蓄＋投資の評価額−負債を、ホームと計画に表示します。計画では積立と期待利回りから投資の評価額を月ごとに見通し、
-  月次締めのたびに実績を記録して、見通しとの差をグラフで確かめられます。
+  投資を除いた「貯蓄−負債」も並べます。月次締めのたびに実績を記録して、見通しとの差をグラフで確かめられます。
 - **ホーム**: 総負債・今月の支払い・今月の残り・純資産・完済予定の5つの数字、期日順の「今月の支払い」チェックリスト（年会費・積立を含む）、
   注意すべきこと、負債・貯蓄・投資の見通しと純資産の実績のグラフ。
 - **4通貨**: JPY・USD・CNY・SGD。表示通貨はヘッダーで切り替え、すべての画面に効きます。
 - **データを安全に**: データファイルはアプリのフォルダの外に置き、起動時（1日1回）・月次締めの前・復元の前・形式の移行の前に自動でバックアップを作ります（直近30個）。
+  「名前を付けて保存」で、今のデータを別の名前のファイルとしても残せます（試算用など）。
 - **表示**: ライト・ダーク・システムに合わせる、のテーマ。日本語と英語。専用のアイコン（ウィンドウ・Dock・タスクバー）。
 
 ## 動作環境
@@ -57,8 +61,10 @@ python3 -m venv ~/.venvs/clear
 ~/.venvs/clear/bin/python launch.py
 ```
 
-## 4.0.0 からの更新
+## 前の版からの更新
 
+- 4.1.2 で 4.1.0・4.1.1 のデータファイルを初めて開くと、**バックアップを作ってから**新しい形式に移行します（理由「形式の移行前」）。
+  中身は変わりません（借入・生活費に「初回の支払い」の欄が加わるだけです）。移行したファイルは 4.1.1 以前では開けません。
 - 4.1.0 で 4.0.0 のデータファイルを初めて開くと、**バックアップを作ってから**新しい形式に移行します（理由「形式の移行前」）。
   移行したファイルは 4.0.0 では開けません。4.0.0 に戻すときは、「データ・設定」のバックアップから移行前の状態を復元してください。
 - 借入は、「個人からの借入」以外を口座引き落としとして引き継ぎます。編集画面でいつでも変えられます。
@@ -85,6 +91,9 @@ python3 -m venv ~/.venvs/clear
    - 借入: 「借入・カード」で行を選び「支払を記録」。支払額と日付、うち利息を確認して記録します。
      編集画面で残高を減らした場合は、その差を今月の支払として記録するか聞きます（利息と元金は自動で分け、二重に引きません）。
    - 自動引き落とし: 引き落とし日を過ぎると、起動時と画面上部の案内から「確認して記録」でまとめて記録できます。
+   - 次の月の分を先に入れるとき: 支払日を過ぎてから編集すると、画面の上に「変更の反映」が出ます。「次回から」を選ぶと、
+     今月の分（引き落とし済み）を編集前の金額で記録してから、変更を次回の支払いに使います。残高をそのままにすると支払い後の残高に、
+     ショッピング一括では次回の請求額を残高に入れます。次の月の請求を別の借入として登録するときは「初回の支払い」を来月にします。
    - 生活費: 「毎月の収支」の生活費の表で「今月」にチェック。
    - 年会費・積立: 請求月・積立日には、ホームの「今月の支払い」に並びます。チェックで支払済・積立済になります。
    - ホームの「今月の支払い」チェックリストからも記録できます。
@@ -94,7 +103,7 @@ python3 -m venv ~/.venvs/clear
    - 試算用のファイルなどは「残高を変えずにまとめて締める」も選べます。
    - 締めは「データ・設定」の「直前の締めを取り消す」で戻せます。
 3. 見通しを確認する
-   - 「計画」で、最大24か月先までの収入・返済・生活費・積立・貯蓄・投資の評価額・負債・純資産を月ごとに確認できます。
+   - 「計画」で、最大24か月先までの収入・返済・生活費・積立・貯蓄・投資の評価額・負債・貯蓄−負債・純資産を月ごとに確認できます。
    - 「投資」の「設定」で、種類ごとの期待利回り（年率、初期値 0%）を変えられます。
 
 ## 投資のページ
@@ -172,20 +181,24 @@ with one net-worth outlook. It succeeds Payback Management 3.x.
 - **Payment ledger** – record what you paid; each payment is split into interest and principal.
 - **Automatic debits** – debts and living costs can be marked as taken from the bank. Past their date they show as
   "to record" (not overdue) and can be recorded in one go; dates falling on Japanese bank holidays move to the next business day.
+- **This month or the next** – an edit made after this month's payment date can apply from the next payment, recording this
+  month's as done; a new debt or living cost can start this month, next month or the month after.
 - **Month-end close** – a three-step wizard confirms last month's payments, adds a month's interest to
   unpaid debts and carries savings over. A backup is taken first and the close can be undone.
 - **Annual card fees** with a billing month; the paid mark resets every year and the fee is part of the plan.
 - **Investments** – shares and ETFs, crypto-assets, precious metals and hand-valued assets, valued at market prices.
   Every kind of price has fallbacks: yfinance → Yahoo Finance directly (→ ExchangeRate-API for exchange rates);
   CoinGecko → Coinbase → bitFlyer. Allocation, trades with moving-average cost, monthly contributions and NISA limits.
-- **Net worth** (savings + investments − debts) on Home and in the plan; the actual figure is recorded at each close.
+- **Net worth** (savings + investments − debts) on Home and in the plan, which also shows savings − debt without the
+  investments; the actual figure is recorded at each close.
 - **Four currencies** (JPY, USD, CNY, SGD) with one display currency for all pages.
-- **Safe data** – data files live outside the app folder; automatic backups (latest 30 per file).
+- **Safe data** – data files live outside the app folder; automatic backups (latest 30 per file); "Save as" keeps a copy
+  under a new name.
 - Light / dark / system theme; Japanese and English.
 
 Requires Python 3.10+. Install with `python3 -m pip install -r requirements.txt` and start with
-`python3 launch.py`. A CLEAR 4.0 data file is backed up and then upgraded the first time 4.1 opens it
-(4.0 cannot open the upgraded file; restore the backup to go back). Prices are for reference only;
+`python3 launch.py`. A data file from an earlier version (4.0, 4.1.0 or 4.1.1) is backed up and then upgraded the
+first time it is opened (the earlier version cannot open the upgraded file; restore the backup to go back). Prices are for reference only;
 yfinance is unofficial and Yahoo Finance data is meant for personal use. Run the tests with `python3 -m pytest`.
 
 Licensed under the Apache License 2.0.

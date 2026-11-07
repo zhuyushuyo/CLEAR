@@ -17,7 +17,7 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 from . import backup, db, engine, invest, logsetup, market, paths, rates
 from .config import AppConfig, save_config
 from .models import Bill, CreditCard, Holding, LivingCost, NetWorthPoint, Profile
-from .money import CURRENCIES, convert
+from .money import CURRENCIES, convert, round_money, unit
 from .periods import Period
 from .repo import ClosePlan, ContribBuy, Repository
 
@@ -317,10 +317,7 @@ class Store(QObject):
         return report
 
     def create_db(self, name: str, open_it: bool = True) -> Path:
-        name = name.strip() or "CLEAR"
-        if not name.lower().endswith(".db"):
-            name += ".db"
-        path = self.data_dir / name
+        path = self.db_file_for(name)
         Repository.create(path, self.today())
         log.info("created %s", path)
         if open_it:
@@ -328,6 +325,28 @@ class Store(QObject):
             self._remember(path)
         self._touch(saved=False)
         return path
+
+    def db_file_for(self, name: str) -> Path:
+        """Where a data file of this name goes: the data folder, with '.db' added when missing."""
+        name = name.strip() or "CLEAR"
+        if not name.lower().endswith(".db"):
+            name += ".db"
+        return self.data_dir / name
+
+    def save_as(self, name: str, switch: bool = True) -> Path:
+        """Save the open data under a new name in the data folder (4.1.2). The original file is
+        left as it is; with `switch` the new file becomes the open one."""
+        repo = self._need()
+        dest = self.db_file_for(name)
+        if dest.exists():
+            raise FileExistsError(str(dest))
+        backup.copy_db(repo.path, dest)
+        log.info("saved %s as %s", repo.path.name, dest.name)
+        if switch:
+            self.repo = Repository(dest)
+            self._remember(dest)
+        self._touch(saved=False)
+        return dest
 
     def import_legacy(self, src: Path, open_it: bool = True) -> tuple[Path, db.MigrationReport]:
         """Copy a Payback Management file into the data folder and migrate the copy."""
@@ -460,6 +479,33 @@ class Store(QObject):
         repo.update_bill(bill)
         repo.record_bill_payment(bill.id, self.state().current, paid_date, amount, max(0.0, amount - drop),
                                  note or "balance edit")
+        self._touch()
+
+    def settle_and_update_bill(self, new: Bill, old: Bill, paid_date: date, amount: float) -> None:
+        """4.1.2: record this month's payment (its date has passed, nothing recorded yet) with the
+        debt as it was saved, then save the edit, which applies from the next payment.
+
+        An unchanged balance becomes the one left after the payment. A lower balance on a debt with
+        interest is taken as the balance after it: the interest is what the payment covers beyond
+        the drop, so the balance ends where it was put (as in B2). Any other balance, such as a card
+        bill's next statement, is kept as entered."""
+        repo = self._need()
+        cur = old.currency
+        same_currency = new.currency == cur
+        unchanged = same_currency and abs(round_money(new.amount, cur) - round_money(old.amount, cur)) < unit(cur)
+        interest = None
+        if same_currency and not unchanged and old.has_interest:
+            drop = round_money(old.amount - new.amount, cur)
+            if 0 < drop <= amount:
+                interest = round_money(amount - drop, cur)
+        repo.settle_and_update_bill(new, self.state().current, paid_date, amount, interest, unchanged,
+                                    "done before edit")
+        self._touch()
+
+    def settle_and_update_living(self, new: LivingCost, old: LivingCost, paid_date: date, amount: float) -> None:
+        """4.1.2: record this month's living cost with its saved amount, then save the edit."""
+        self._need().settle_and_update_living(new, self.state().current, paid_date, amount, old.currency,
+                                              "done before edit")
         self._touch()
 
     def pending_debits(self) -> list[engine.DueItem]:

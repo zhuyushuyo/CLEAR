@@ -245,12 +245,15 @@ S: dict[str, tuple[str, str]] = {
     "plan.months_n": ("{n}か月", "{n} months"),
     "plan.col.month": ("月", "Month"),
     "plan.col.income": ("収入", "Income"),
-    "plan.col.debt": ("借入の返済", "Debt payments"),
+    "plan.col.debt": ("借入の返済", "Repayments"),
     "plan.col.living": ("生活費", "Living costs"),
     "plan.col.net": ("収支", "Net"),
     "plan.col.savings": ("貯蓄残高", "Savings"),
     "plan.col.balance": ("負債残高", "Debt"),
     "plan.col.worth": ("純資産", "Net worth"),
+    "plan.col.cash_net": ("貯蓄−負債", "Savings − debt"),
+    "plan.col.cash_net_tip": ("投資を除いた純資産: 貯蓄残高 − 負債残高", "Net worth without investments: savings − debt"),
+    "plan.col.worth_tip": ("貯蓄残高 ＋ 投資の評価額 − 負債残高", "Savings + investments − debt"),
     "plan.this_month": ("{period}（今月）", "{period} (now)"),
     "plan.note_cards": ("借入一覧で管理していないカードの利用額（{amount}）は含みません。",
                         "Card balances not in the debts list ({amount}) are not included."),
@@ -274,6 +277,24 @@ S: dict[str, tuple[str, str]] = {
     "data.file.import": ("旧版から取り込む…", "Import from 3.x…"),
     "data.file.new_name_q": ("新しいファイルの名前", "Name of the new file"),
     "data.file.exists": ("同じ名前のファイルがあります", "A file with this name already exists"),
+    "data.file.save_as": ("名前を付けて保存…", "Save as…"),
+    "data.file.save_as_tip": ("今のデータを、新しい名前のファイルとして保存します（{keys}）",
+                              "Save the current data as a new file ({keys})"),
+    "saveas.title": ("名前を付けて保存", "Save as"),
+    "saveas.ok": ("保存", "Save"),
+    "saveas.intro": ("今のデータ（{name}）を、データの保存場所に新しい名前で保存します。元のファイルはそのまま残ります。",
+                     "The current data ({name}) is saved under a new name in the data folder. "
+                     "The original file stays as it is."),
+    "saveas.name": ("新しい名前", "New name"),
+    "saveas.switch": ("保存したら、新しいファイルに切り替える", "Switch to the new file after saving"),
+    "saveas.switch_hint": ("切り替えないときは、今のファイルのまま続けます。", "Otherwise you go on with the current file."),
+    "saveas.where": ("保存先: {path}", "Saved to: {path}"),
+    "saveas.done": ("「{name}」として保存しました", "Saved as \"{name}\""),
+    "saveas.done_switch": ("「{name}」として保存し、このファイルに切り替えました", "Saved as \"{name}\" and switched to it"),
+    "file.err.empty": ("名前を入力してください", "Enter a name"),
+    "file.err.chars": ("ファイル名に使えない文字が含まれています（\\ / : * ? \" < > |）",
+                       "The name contains characters that a file name cannot have (\\ / : * ? \" < > |)"),
+    "file.err.reserved": ("この名前はファイル名に使えません", "This name cannot be used for a file"),
     "data.backup.title": ("バックアップ", "Backups"),
     "data.backup.sub": ("起動時（1日1回）・月次締めと復元の前に自動で作り、直近{n}個を残します",
                         "Made at start-up (daily), before a close and before a restore; the latest {n} are kept"),
@@ -339,7 +360,7 @@ S: dict[str, tuple[str, str]] = {
     "bill.f.currency": ("通貨", "Currency"),
     "bill.f.rate": ("年利（%）", "Annual rate (%)"),
     "bill.f.monthly": ("毎月の返済額", "Monthly payment"),
-    "bill.f.this_month": ("今月だけ違う金額", "This month only"),
+    "bill.f.one_off": ("1回だけ違う金額", "One-off amount"),
     "bill.f.this_month_hint": ("0 なら毎月の返済額を使います", "0 = use the monthly payment"),
     "bill.f.due_day": ("支払日（毎月）", "Due day (monthly)"),
     "bill.f.created": ("登録日", "Added on"),
@@ -521,6 +542,32 @@ S: dict[str, tuple[str, str]] = {
     "pay.err.below_drop": ("支払額が残高の減少分（{drop}）より少なくなっています", "The amount is less than the drop in balance ({drop})"),
     "alert.pending_debit": ("「{name}」の引き落とし（{date}・{amount}）が記録されていません",
                             "\"{name}\" was due to be debited on {date} ({amount}) and is not recorded"),
+
+    # ---- 4.1.2: this month's payment or the next one -------------------------------------------------
+    "when.title": ("変更の反映", "Apply from"),
+    "when.next": ("次回（{date}）から", "Next payment ({date})"),
+    "when.now": ("今月（{date}）から", "This month ({date})"),
+    "when.done_debit": ("{date}の引き落とし（{amount}）は済みとして記録します。",
+                        "The {date} debit ({amount}) is recorded as done."),
+    "when.done_paid": ("{date}の支払い（{amount}）は済みとして記録します。",
+                       "The {date} payment ({amount}) is recorded as done."),
+    "when.keep_balance": ("残高をそのままにすると、支払い後の残高にします。",
+                          "A balance left as it is becomes the balance after it."),
+    "when.none": ("今月（{date}）の支払いはなしとします。", "Nothing is due this month ({date})."),
+    "when.now_hint": ("まだ記録されていない今月 {date} の分から、この内容を使います。",
+                      "Used from this month's {date} payment, which is not recorded yet."),
+    "when.recorded": ("「{name}」の{date}の分（{amount}）を記録し、変更は次回から反映しました",
+                      "Recorded \"{name}\" for {date} ({amount}); the changes apply from the next payment"),
+    "first.title": ("初回の支払い", "First payment"),
+    "first.opt": ("{date}（{rel}）", "{date} ({rel})"),
+    "first.rel0": ("今月", "this month"),
+    "first.rel1": ("来月", "next month"),
+    "first.rel2": ("再来月", "in two months"),
+    "first.hint": ("これより前の月は、支払いなしとして数えます。", "Nothing is due in the months before it."),
+    "due.cell_next": ("{day}日 ・次は{date}", "{day} · next {date}"),
+    "due.cell_from": ("{day}日 ・{date}から", "{day} · from {date}"),
+    "due.next_tip": ("次の支払い: {date} {amount}", "Next payment: {date}, {amount}"),
+    "debts.status_from": ("{month}から", "From {month}"),
 
     # ---- 4.1: annual card fees (B1) -------------------------------------------------------------------
     "fee.free": ("無料", "Free"),
@@ -873,3 +920,8 @@ def label_of(prefix: str, code: str) -> str:
 
 def join_names(names: list[str]) -> str:
     return ("、" if _lang == "ja" else ", ").join(names)
+
+
+def join_sentences(*parts: str) -> str:
+    """Sentences one after the other (no space between Japanese sentences)."""
+    return ("" if _lang == "ja" else " ").join(p for p in parts if p)

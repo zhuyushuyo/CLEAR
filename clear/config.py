@@ -17,11 +17,12 @@ log = logging.getLogger(__name__)
 DEFAULT_HIDDEN = {"bills": [13], "cards": [13], "living": [8, 9], "plan": [], "invest": [11, 12, 13]}
 
 # Version of the table column layouts. 1 = 4.0, 2 = 4.1 (cards: one annual-fee column;
-# plan: contributions and investments). Saved hidden columns and widths are moved to
-# the new positions once.
-COLUMNS_VERSION = 2
+# plan: contributions and investments), 3 = 4.1.2 (plan: savings minus debt before net worth).
+# Saved hidden columns and widths are moved to the new positions once, one step at a time.
+COLUMNS_VERSION = 3
 _CARDS_1_TO_2 = {**{i: i for i in range(11)}, 12: 11, 13: 12, 14: 13}       # old 11 (fee status) is merged
 _PLAN_1_TO_2 = {0: 0, 1: 1, 2: 2, 3: 3, 4: 5, 5: 6, 6: 8, 7: 9}
+_PLAN_2_TO_3 = {**{i: i for i in range(9)}, 9: 10}
 
 
 @dataclass
@@ -107,22 +108,28 @@ def _remap_widths(widths, mapping: dict[int, int], size: int) -> list[int]:
 
 
 def _migrate_columns(cfg: AppConfig) -> None:
-    """Move saved hidden columns and widths to the 4.1 column positions (once)."""
+    """Move saved hidden columns and widths to the current column positions (once per version)."""
     if cfg.columns_version >= COLUMNS_VERSION:
         return
     hidden = dict(cfg.hidden_columns or {})
     widths = dict(cfg.column_widths or {})
-    if "cards" in hidden:
-        hidden["cards"] = _remap(hidden["cards"], _CARDS_1_TO_2)
-    if "plan" in hidden:
-        hidden["plan"] = _remap(hidden["plan"], _PLAN_1_TO_2)
-    if widths.get("cards"):
-        new = _remap_widths(widths["cards"], _CARDS_1_TO_2, 14)
-        new[10] = max(new[10], 210)  # the annual-fee column now carries the status as well
-        widths["cards"] = new
-    if widths.get("plan"):
-        widths["plan"] = _remap_widths(widths["plan"], _PLAN_1_TO_2, 10)
-    hidden.setdefault("invest", list(DEFAULT_HIDDEN["invest"]))
+    if cfg.columns_version < 2:  # 4.0 -> 4.1
+        if "cards" in hidden:
+            hidden["cards"] = _remap(hidden["cards"], _CARDS_1_TO_2)
+        if "plan" in hidden:
+            hidden["plan"] = _remap(hidden["plan"], _PLAN_1_TO_2)
+        if widths.get("cards"):
+            new = _remap_widths(widths["cards"], _CARDS_1_TO_2, 14)
+            new[10] = max(new[10], 210)  # the annual-fee column now carries the status as well
+            widths["cards"] = new
+        if widths.get("plan"):
+            widths["plan"] = _remap_widths(widths["plan"], _PLAN_1_TO_2, 10)
+        hidden.setdefault("invest", list(DEFAULT_HIDDEN["invest"]))
+    if cfg.columns_version < 3:  # 4.1 -> 4.1.2
+        if "plan" in hidden:
+            hidden["plan"] = _remap(hidden["plan"], _PLAN_2_TO_3)
+        if widths.get("plan"):
+            widths["plan"] = _remap_widths(widths["plan"], _PLAN_2_TO_3, 11)
     cfg.hidden_columns = hidden
     cfg.column_widths = widths
     cfg.columns_version = COLUMNS_VERSION

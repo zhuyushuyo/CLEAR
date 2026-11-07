@@ -89,7 +89,9 @@ class DebtsPage(Page):
         payoffs = engine.bill_payoffs(st)
         for r, b in enumerate(st.bills):
             paid = st.paid_bills.get(b.id)
-            this_month = paid.amount if paid and paid.paid else engine.planned_amount(b, cur_period)
+            is_paid = bool(paid and paid.paid)
+            later = not is_paid and not engine.started(b, cur_period)   # first payment in a later month
+            this_month = paid.amount if is_paid else engine.planned_amount(b, cur_period)
             info = payoffs[b.id]
             tot_bal += convert(b.amount, b.currency, target, rates)
             tot_month += convert(this_month, b.currency, target, rates)
@@ -109,10 +111,25 @@ class DebtsPage(Page):
             monthly = "—" if b.is_lump_sum else fmt_number(b.monthly_payment, b.currency)
             tbl.setItem(r, 7, item(monthly, RIGHT, tone="critical" if underwater else None,
                                    tooltip=alert_tip(b) if underwater else None))
-            tbl.setItem(r, 8, item(fmt_number(this_month, b.currency), RIGHT))
-            if paid and paid.paid:
-                tbl.setItem(r, 9, item(t("due.cell_day", day=b.monthly_due_day), tone="text_muted"))
+            nxt = engine.next_period(b, cur_period, is_paid)
+            nxt_due = engine.due_date(nxt, b.monthly_due_day)
+            nxt_amount = engine.planned_amount(b, nxt)
+            nxt_tip = t("due.next_tip", date=fmt_md(nxt_due), amount=money(nxt_amount, b.currency)) \
+                if nxt_amount > 0 else None
+            if later:
+                tbl.setItem(r, 8, item("—", RIGHT, tone="text_faint", tooltip=nxt_tip))
+            else:
+                tbl.setItem(r, 8, item(fmt_number(this_month, b.currency), RIGHT))
+            if is_paid:
+                text = t("due.cell_next", day=b.monthly_due_day, date=fmt_md(nxt_due, weekday=False)) \
+                    if nxt_amount > 0 else t("due.cell_day", day=b.monthly_due_day)
+                tbl.setItem(r, 9, item(text, tone="text_muted", tooltip=nxt_tip))
                 tbl.setItem(r, 10, item("✓ " + t("common.paid"), tone="good"))
+            elif later:
+                tbl.setItem(r, 9, item(t("due.cell_from", day=b.monthly_due_day, date=fmt_md(nxt_due, weekday=False)),
+                                       tone="text_muted", tooltip=nxt_tip))
+                tbl.setItem(r, 10, item(t("debts.status_from", month=month_name(nxt.month)), tone="text_muted",
+                                        tooltip=nxt_tip))
             elif b.amount <= 0:
                 tbl.setItem(r, 9, item(t("due.cell_day", day=b.monthly_due_day), tone="text_muted"))
                 tbl.setItem(r, 10, item("—", tone="text_faint"))

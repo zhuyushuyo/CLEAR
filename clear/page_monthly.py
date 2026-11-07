@@ -135,17 +135,28 @@ class MonthlyPage(Page):
                 else:
                     cash += v
                 paid = st.paid_living.get(lc.id)
+                is_paid = bool(paid and paid.paid)
+                later = not is_paid and not engine.started(lc, st.current)   # first payment in a later month
                 due = engine.due_date(st.current, lc.monthly_due_day)
                 nominal = st.current.day(lc.monthly_due_day)
                 days = (due - st.today).days
+                nxt = engine.next_period(lc, st.current, is_paid)
+                nxt_due = engine.due_date(nxt, lc.monthly_due_day)
+                nxt_tip = t("due.next_tip", date=fmt_md(nxt_due), amount=money(lc.amount, lc.currency))
                 tbl.setItem(r, 0, item(category_label(lc.category), data=lc.id, tone="text_muted"))
                 tbl.setItem(r, 1, item(lc.name, data=lc.id, bold=True))
                 tbl.setItem(r, 2, item(lc.description, tone="text_muted"))
                 tbl.setItem(r, 3, item(fmt_number(lc.amount, lc.currency), RIGHT))
                 tbl.setItem(r, 4, item(lc.currency, CENTER, tone="text_muted"))
                 tbl.setItem(r, 5, item(method_label(lc.payment_method)))
-                if paid and paid.paid:
+                if is_paid and not lc.is_card:
+                    tbl.setItem(r, 6, item(t("due.cell_next", day=lc.monthly_due_day,
+                                             date=fmt_md(nxt_due, weekday=False)), tone="text_muted", tooltip=nxt_tip))
+                elif is_paid:
                     tbl.setItem(r, 6, item(t("due.cell_day", day=lc.monthly_due_day), tone="text_muted"))
+                elif later:
+                    tbl.setItem(r, 6, item(t("due.cell_from", day=lc.monthly_due_day,
+                                             date=fmt_md(nxt_due, weekday=False)), tone="text_muted", tooltip=nxt_tip))
                 elif days < 0 and lc.auto_debit:
                     tbl.setItem(r, 6, item(t("due.cell_pending", day=lc.monthly_due_day), tone="warning",
                                            tooltip=t("due.pending_tip")))
@@ -157,7 +168,10 @@ class MonthlyPage(Page):
                     else:
                         text, tip = t("due.cell", day=lc.monthly_due_day, rel=due_text(days)), None
                     tbl.setItem(r, 6, item(text, tone=tone, tooltip=tip))
-                tbl.setItem(r, PAID_COL, check_item(bool(paid and paid.paid), r, enabled=self.store.has_db))
+                if later:  # nothing to tick this month
+                    tbl.setItem(r, PAID_COL, item("—", tone="text_faint", tooltip=nxt_tip))
+                else:
+                    tbl.setItem(r, PAID_COL, check_item(is_paid, r, enabled=self.store.has_db))
                 tbl.setItem(r, 8, item(fmt_date(lc.created_date), tone="text_muted"))
                 tbl.setItem(r, 9, item(fmt_date(lc.last_updated), tone="text_muted"))
         finally:

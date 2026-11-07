@@ -2,7 +2,7 @@
 
 Files from Payback Management 3.x have ``PRAGMA user_version = 0`` and may lack
 columns that were added over time; ``migrate`` brings any of them to the current
-layout inside a single transaction (3.x -> 1 -> 2, one step after the other). Connections are opened per operation and
+layout inside a single transaction (3.x -> 1 -> 2 -> 3, one step after the other). Connections are opened per operation and
 closed right away, so Google Drive can sync the file while the app is idle.
 """
 
@@ -37,6 +37,7 @@ SCHEMA: dict[str, list[tuple[str, str]]] = {
         ("current_month_payment", "REAL DEFAULT 0"), ("paid_this_month", "INTEGER DEFAULT 0"),
         ("created_date", "TEXT"), ("sort_order", "INTEGER"),
         ("cmp_period", "TEXT DEFAULT ''"), ("note", "TEXT DEFAULT ''"), ("auto_debit", "INTEGER DEFAULT 1"),
+        ("start_period", "TEXT DEFAULT ''"),
     ],
     "living_costs": [
         ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
@@ -44,6 +45,7 @@ SCHEMA: dict[str, list[tuple[str, str]]] = {
         ("currency", "TEXT DEFAULT 'JPY'"), ("monthly_due_day", "INTEGER DEFAULT 1"),
         ("paid_this_month", "INTEGER DEFAULT 0"), ("created_date", "TEXT"),
         ("payment_method", "TEXT DEFAULT 'Cash'"), ("description", "TEXT DEFAULT ''"), ("last_updated", "TEXT"),
+        ("start_period", "TEXT DEFAULT ''"),
     ],
     "credit_cards": [
         ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
@@ -268,6 +270,12 @@ def _get(row: sqlite3.Row, key: str, default: object = None) -> object:
     return row[key] if key in row.keys() else default
 
 
+def _period_text(value: object) -> str:
+    """'YYYY-MM' for a valid month, '' otherwise."""
+    p = Period.try_parse(value) if value else None
+    return str(p) if p is not None else ""
+
+
 # ---------------------------------------------------------------------------
 # Row <-> model
 # ---------------------------------------------------------------------------
@@ -290,6 +298,7 @@ def row_to_bill(row: sqlite3.Row) -> Bill:
         sort_order=_int(_get(row, "sort_order"), row["id"] or 0),
         note=str(_get(row, "note") or ""),
         auto_debit=bool(_int(_get(row, "auto_debit", 1), 1)),
+        start_period=_period_text(_get(row, "start_period")),
     )
 
 
@@ -308,6 +317,7 @@ def row_to_living(row: sqlite3.Row) -> LivingCost:
         payment_method=method if method in PAYMENT_METHODS else "Cash",
         created_date=created,
         last_updated=parse_date(_get(row, "last_updated")) or created,
+        start_period=_period_text(_get(row, "start_period")),
     )
 
 
@@ -351,23 +361,25 @@ def row_to_payment(row: sqlite3.Row) -> Payment:
 
 BILL_COLUMNS = ("bill_type", "bill_name", "borrower_name", "lender_name", "amount", "currency",
                 "interest_rate", "monthly_payment", "monthly_due_day", "current_month_payment",
-                "cmp_period", "created_date", "sort_order", "note", "auto_debit")
+                "cmp_period", "created_date", "sort_order", "note", "auto_debit", "start_period")
 
 
 def bill_values(b: Bill) -> tuple:
     return (b.bill_type, b.bill_name, b.borrower_name, b.lender_name, round_money(b.amount, b.currency),
             b.currency, b.interest_rate, round_money(b.monthly_payment, b.currency), int(b.monthly_due_day),
             round_money(b.current_month_payment, b.currency), b.cmp_period or "",
-            date_text(b.created_date), int(b.sort_order or 0), b.note or "", int(bool(b.auto_debit)))
+            date_text(b.created_date), int(b.sort_order or 0), b.note or "", int(bool(b.auto_debit)),
+            _period_text(b.start_period))
 
 
 LIVING_COLUMNS = ("category", "name", "description", "amount", "currency", "monthly_due_day",
-                  "payment_method", "created_date", "last_updated")
+                  "payment_method", "created_date", "last_updated", "start_period")
 
 
 def living_values(lc: LivingCost) -> tuple:
     return (lc.category, lc.name, lc.description, round_money(lc.amount, lc.currency), lc.currency,
-            int(lc.monthly_due_day), lc.payment_method, date_text(lc.created_date), date_text(lc.last_updated))
+            int(lc.monthly_due_day), lc.payment_method, date_text(lc.created_date), date_text(lc.last_updated),
+            _period_text(lc.start_period))
 
 
 CARD_COLUMNS = ("issuer", "name", "due_day", "annual_fee", "paid_annual_fee", "credit_limit", "currency",
@@ -677,6 +689,8 @@ def migrate(path: str | Path, today: date | None = None) -> MigrationReport:
                 _migrate_0_to_1(conn, today, report)
             if version < 2:
                 _migrate_1_to_2(conn, today, report)
+            if version < 3:
+                _migrate_2_to_3(conn, report)
             set_meta(conn, schema_version=SCHEMA_VERSION, app_version=APP_VERSION)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         report.bills = conn.execute("SELECT COUNT(*) FROM bills").fetchone()[0]
@@ -763,6 +777,14 @@ def _migrate_1_to_2(conn: sqlite3.Connection, today: date, report: MigrationRepo
                  "(fee_paid_period IS NULL OR fee_paid_period='')", (str(today.year),))
     set_meta(conn, upgraded_to_2_at=now_text())
     report.changes.append("4.1: auto debit, annual fee year")
+
+
+def _migrate_2_to_3(conn: sqlite3.Connection, report: MigrationReport) -> None:
+    """4.1.0/4.1.1 -> 4.1.2: the month of the first payment on debts and living costs.
+
+    The new columns are added empty by ensure_schema: every existing item keeps its payments as before."""
+    set_meta(conn, upgraded_to_3_at=now_text())
+    report.changes.append("4.1.2: first payment month")
 
 
 def create_new(path: str | Path, today: date | None = None) -> None:

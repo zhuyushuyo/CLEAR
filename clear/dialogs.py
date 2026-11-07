@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout,
-                             QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QTableWidget,
-                             QVBoxLayout, QWidget)
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDialog, QFormLayout,
+                             QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+                             QRadioButton, QTableWidget, QVBoxLayout, QWidget)
 
-from . import engine
+from . import engine, paths
 from .config import DEFAULT_HIDDEN
 from .i18n import (bill_type_label, category_from_label, category_label, fmt_date, fmt_md, fmt_period,
-                   method_label, money, month_name, t)
+                   join_sentences, method_label, money, month_name, t)
 from .models import (BILL_TYPES, CATEGORY_KEYS, LUMP_SUM_TYPES, NO_INTEREST_TYPES, PAYMENT_METHODS,
                      PLAN_OPTIONAL_TYPES, Bill, CreditCard, LivingCost)
 from .money import round_money
@@ -142,12 +143,113 @@ def money_row(spin: MoneySpin, combo: CurrencyCombo) -> QHBoxLayout:
 
 
 # ---------------------------------------------------------------------------------------------------
+# 4.1.2: which month's payment the figures are for
+# ---------------------------------------------------------------------------------------------------
+def today_in(current: Period, today: date | None) -> date:
+    """Today, or the first day of `current` when today lies in another month."""
+    d = today or date.today()
+    return d if Period.from_date(d) == current else current.first_day
+
+
+class FirstPaymentCombo(QComboBox):
+    """The month of the first payment: this month or one of the next two (shown with its date)."""
+
+    def __init__(self, current: Period, day: int, start: Period | None = None):
+        super().__init__()
+        self.current = current
+        self.touched = False                 # chosen by hand: no longer follows the payment day
+        self.periods = [current.add(k) for k in range(3)]
+        if start is not None and start > current and start not in self.periods:
+            self.periods.append(start)
+        self.activated.connect(self._touch)
+        self.set_day(day)
+        if start is not None:
+            self.set_period(start)
+
+    def _touch(self, _index: int) -> None:
+        self.touched = True
+
+    def set_day(self, day: int) -> None:
+        keep = self.currentData()
+        self.blockSignals(True)
+        self.clear()
+        for p in self.periods:
+            k = self.current.months_until(p)
+            rel = t(f"first.rel{k}") if k <= 2 else fmt_period(p)
+            self.addItem(t("first.opt", date=fmt_md(engine.due_date(p, day), weekday=False), rel=rel), str(p))
+        self.setCurrentIndex(max(0, self.findData(keep)) if keep else 0)
+        self.blockSignals(False)
+
+    def period(self) -> Period:
+        return Period.try_parse(self.currentData()) or self.current
+
+    def set_period(self, p: Period) -> None:
+        i = self.findData(str(p))
+        if i >= 0:
+            self.setCurrentIndex(i)
+
+
+class ApplyFromRow(QWidget):
+    """After this month's payment date, with nothing recorded: do the edited figures start with
+    the next payment (this month's counts as done) or with this month's?"""
+
+    changed = pyqtSignal()
+
+    def __init__(self, due: date, from_next: bool):
+        super().__init__()
+        self.due = due
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        row = QHBoxLayout()
+        row.setSpacing(18)
+        self.next_btn = QRadioButton()
+        self.now_btn = QRadioButton()
+        group = QButtonGroup(self)
+        group.addButton(self.next_btn)
+        group.addButton(self.now_btn)
+        row.addWidget(self.next_btn)
+        row.addWidget(self.now_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self.hint = label("", "Hint", wrap=True)
+        lay.addWidget(self.hint)
+        (self.next_btn if from_next else self.now_btn).setChecked(True)
+        self.next_btn.toggled.connect(lambda _on: self.changed.emit())
+
+    @property
+    def from_next(self) -> bool:
+        return self.next_btn.isChecked()
+
+    def set_texts(self, next_due: date, hint_next: str, hint_now: str) -> None:
+        self.next_btn.setText(t("when.next", date=fmt_md(next_due, weekday=False)))
+        self.now_btn.setText(t("when.now", date=fmt_md(self.due, weekday=False)))
+        self.hint.setText(hint_next if self.from_next else hint_now)
+
+
+def done_text(due: date, amount: float, currency: str, auto: bool) -> str:
+    return t("when.done_debit" if auto else "when.done_paid", date=fmt_md(due, weekday=False),
+             amount=money(amount, currency))
+
+
+# ---------------------------------------------------------------------------------------------------
 class BillDialog(FormDialog):
-    def __init__(self, parent: QWidget | None, bill: Bill | None, current: Period, default_currency: str):
+    def __init__(self, parent: QWidget | None, bill: Bill | None, current: Period, default_currency: str,
+                 today: date | None = None, paid: bool = False):
         super().__init__(t("bill.title_edit" if bill else "bill.title_add"), parent, deletable=bill is not None)
         self.current = current
+        self.today = today_in(current, today)
         self.src = bill
+        self.paid = bool(paid) and bill is not None          # this month's payment is recorded
         b = bill or Bill(currency=default_currency, created_date=date.today())
+        # 4.1.2: an edit after this month's payment date, while nothing is recorded, may be meant for
+        # the next payment; a new debt (or one that has not started) chooses its first payment month.
+        self.open_due = engine.due_date(current, b.monthly_due_day)
+        self.applies = (bill is not None and engine.started(bill, current) and not self.paid
+                        and self.open_due <= self.today)
+        self.open_amount = engine.planned_amount(bill, current) if self.applies else 0.0
+        self.choose_first = bill is None or (not self.paid and not engine.started(bill, current))
+
         self.name = QLineEdit(b.bill_name)
         self.name.setPlaceholderText(t("bill.f.name_ph"))
         self.type = QComboBox()
@@ -166,13 +268,20 @@ class BillDialog(FormDialog):
         self.monthly = MoneySpin(b.currency)
         self.monthly.setValue(b.monthly_payment)
         self.one_off = MoneySpin(b.currency)
-        self.one_off.setValue(b.current_month_payment if b.cmp_period == str(current) else 0)
         self.due = DayCombo()
         self.due.setValue(b.monthly_due_day)
         self.auto_debit = QCheckBox(t("bill.f.auto_debit"))
         self.auto_debit.setChecked(b.auto_debit if bill else b.bill_type not in PLAN_OPTIONAL_TYPES)
         self.created = DateField(b.created_date or date.today())
+        self.apply_from = ApplyFromRow(self.open_due, b.auto_debit) if self.applies else None
+        self.first = None
+        if self.choose_first:
+            self.first = FirstPaymentCombo(current, b.monthly_due_day, engine.start_of(bill) if bill else None)
+            if bill is None:
+                self._default_first()
 
+        if self.apply_from is not None:
+            self.row(t("when.title"), self.apply_from)
         self.row(t("bill.f.name"), self.name)
         self.row(t("bill.f.type"), self.type)
         self.row(t("bill.f.lender"), self.lender)
@@ -180,21 +289,81 @@ class BillDialog(FormDialog):
         self.row(t("bill.f.balance"), money_row(self.balance, self.currency))
         self.row(t("bill.f.rate"), self.rate)
         self.row(t("bill.f.monthly"), self.monthly)
-        self.row(t("bill.f.this_month") + f"\n({fmt_period(current)})", self.one_off, t("bill.f.this_month_hint"))
+        self.row(t("bill.f.one_off"), self.one_off, t("bill.f.this_month_hint"))
+        self.one_off_label = self.form.labelForField(self._fields[id(self.one_off)])
         self.row(t("bill.f.due_day"), self.due)
+        if self.first is not None:
+            self.row(t("first.title"), self.first, t("first.hint"))
         self.row("", self.auto_debit, t("bill.f.auto_debit_hint"))
         self.row(t("bill.f.created"), self.created)
         self.type_hint = label("", "Hint", wrap=True)
         self.form.addRow("", self.type_hint)
+        target = self._target()
+        self.one_off.setValue(b.current_month_payment if b.cmp_period == str(target) else 0)
 
         self.type.currentIndexChanged.connect(self._sync)
         self.currency.currentTextChanged.connect(self._currency_changed)
         for w in (self.balance, self.rate, self.monthly, self.one_off):
             w.valueChanged.connect(self._update_preview)
-        self.due.currentIndexChanged.connect(self._update_preview)
+        self.due.currentIndexChanged.connect(self._day_changed)
+        if self.apply_from is not None:
+            self.apply_from.changed.connect(self._target_changed)
+        if self.first is not None:
+            self.first.currentIndexChanged.connect(self._target_changed)
         self._sync()
         self.name.setFocus()
 
+    # ---- which payment ----------------------------------------------------------------------------
+    def _default_first(self) -> None:
+        """A new debt whose payment day has already come this month starts next month."""
+        if self.first is not None and not self.first.touched:
+            this = engine.due_date(self.current, self.due.value())
+            self.first.set_period(self.current if this > self.today else self.current.add(1))
+
+    def _target(self) -> Period:
+        """The month the one-off amount and the edit are for."""
+        if self.first is not None:
+            return self.first.period()
+        if self.paid:
+            return self.current.add(1)
+        if self.apply_from is not None:
+            return self.current.add(1) if self.apply_from.from_next else self.current
+        return self.current
+
+    @property
+    def from_next(self) -> bool:
+        """True when this month's payment counts as done (or as none) and the edit starts after it."""
+        return self.apply_from is not None and self.apply_from.from_next
+
+    def settle(self) -> tuple[date, float] | None:
+        """This month's payment to record before saving: (date, amount in the old currency)."""
+        if self.from_next and self.open_amount > 0:
+            return self.open_due, self.open_amount
+        return None
+
+    def _day_changed(self) -> None:
+        if self.first is not None:
+            self.first.set_day(self.due.value())
+            self._default_first()
+        self._target_changed()
+
+    def _target_changed(self) -> None:
+        target = self._target()
+        self.one_off_label.setText(t("bill.f.one_off") + f"\n({fmt_period(target)})")
+        if self.apply_from is not None:
+            cur = self.src.currency
+            if self.open_amount > 0:
+                hint_next = join_sentences(done_text(self.open_due, self.open_amount, cur, self.src.auto_debit),
+                                           t("when.keep_balance"))
+            else:
+                hint_next = t("when.none", date=fmt_md(self.open_due, weekday=False))
+            self.apply_from.set_texts(engine.due_date(self.current.add(1), self.due.value()), hint_next,
+                                      t("when.now_hint", date=fmt_md(self.open_due, weekday=False)))
+        self._update_preview()
+        if self.isVisible():
+            self.fit_height()
+
+    # ---- form ---------------------------------------------------------------------------------------
     def _currency_changed(self, cur: str) -> None:
         for w in (self.balance, self.monthly, self.one_off):
             w.set_currency(cur)
@@ -214,7 +383,7 @@ class BillDialog(FormDialog):
         hint = t("bill.lump_hint") if lump else t("bill.people_hint") if code in PLAN_OPTIONAL_TYPES else ""
         self.type_hint.setText(hint)
         self.type_hint.setVisible(bool(hint))
-        self._update_preview()
+        self._target_changed()
 
     def result_bill(self) -> Bill:
         code = self._code()
@@ -228,19 +397,30 @@ class BillDialog(FormDialog):
         b.amount = round_money(self.balance.value(), cur)
         b.interest_rate = 0.0 if code in NO_INTEREST_TYPES else self.rate.value()
         b.monthly_payment = 0.0 if code in LUMP_SUM_TYPES else round_money(self.monthly.value(), cur)
+        target = self._target()
         one_off = 0.0 if code in LUMP_SUM_TYPES else round_money(self.one_off.value(), cur)
         if one_off > 0:
-            b.current_month_payment, b.cmp_period = one_off, str(self.current)
-        elif b.cmp_period == str(self.current):
+            b.current_month_payment, b.cmp_period = one_off, str(target)
+        elif b.cmp_period == str(target):
             b.current_month_payment, b.cmp_period = 0.0, ""
         b.monthly_due_day = self.due.value()
         b.auto_debit = self.auto_debit.isChecked()
         b.created_date = self.created.value()
+        if self.first is not None:
+            b.start_period = str(self.first.period())
+        elif self.from_next and self.open_amount <= 0:
+            b.start_period = str(self.current.add(1))     # nothing was due this month: start with the next
         return b
 
     def _update_preview(self) -> None:
         b = self.result_bill()
-        info = engine.payoff_info(b, self.current)
+        paid = None
+        settle = self.settle()
+        if self.paid or settle is not None:
+            paid = engine.PeriodPaid(count=1)
+            if settle is not None and b.currency == self.src.currency and abs(b.amount - self.src.amount) < 0.005:
+                b.amount = engine.split_payment(self.src, self.src.amount, settle[1]).balance_after
+        info = engine.payoff_info(b, self.current, paid)
         if info.status == "ok":
             text = t("bill.preview.ok", period=fmt_period(info.period), n=info.months,
                      interest=money(info.remaining_interest, b.currency))
@@ -270,10 +450,19 @@ class BillDialog(FormDialog):
 
 # ---------------------------------------------------------------------------------------------------
 class LivingDialog(FormDialog):
-    def __init__(self, parent: QWidget | None, lc: LivingCost | None, default_currency: str):
+    def __init__(self, parent: QWidget | None, lc: LivingCost | None, default_currency: str,
+                 today: date | None = None, paid: bool = False):
         super().__init__(t("living.title_edit" if lc else "living.title_add"), parent, deletable=lc is not None)
         self.src = lc
+        self.today = today or date.today()
+        self.current = Period.from_date(self.today)
+        self.paid = bool(paid) and lc is not None
         x = lc or LivingCost(currency=default_currency, category="Food/Groceries")
+        # 4.1.2: see BillDialog. Living costs paid by card have no payment date of their own.
+        self.open_due = engine.due_date(self.current, x.monthly_due_day)
+        self.applies = (lc is not None and not lc.is_card and lc.amount > 0 and engine.started(lc, self.current)
+                        and not self.paid and self.open_due <= self.today)
+        self.choose_first = lc is None or (not self.paid and not engine.started(lc, self.current))
         self.category = QComboBox()
         self.category.setEditable(True)
         for key in CATEGORY_KEYS:
@@ -295,17 +484,61 @@ class LivingDialog(FormDialog):
         for code in PAYMENT_METHODS:
             self.method.addItem(method_label(code), code)
         self.method.setCurrentIndex(max(0, self.method.findData(x.payment_method)))
+        self.apply_from = ApplyFromRow(self.open_due, x.auto_debit) if self.applies else None
+        self.first = None
+        if self.choose_first:
+            self.first = FirstPaymentCombo(self.current, x.monthly_due_day, engine.start_of(lc) if lc else None)
+            if lc is None:
+                self._default_first()
+        if self.apply_from is not None:
+            self.row(t("when.title"), self.apply_from)
         self.row(t("living.f.category"), self.category)
         self.row(t("living.f.name"), self.name)
         self.row(t("living.f.detail"), self.detail)
         self.row(t("living.f.amount"), money_row(self.amount, self.currency))
         self.row(t("living.f.due_day"), self.due)
+        if self.first is not None:
+            self.row(t("first.title"), self.first, t("first.hint"))
         self.row(t("living.f.method"), self.method)
         if lc is not None:
             self.preview.setText(t("living.f.dates", created=fmt_date(lc.created_date),
                                    updated=fmt_date(lc.last_updated)))
         self.currency.currentTextChanged.connect(self.amount.set_currency)
+        self.due.currentIndexChanged.connect(self._day_changed)
+        if self.apply_from is not None:
+            self.apply_from.changed.connect(self._texts)
+        self._texts()
         self.name.setFocus()
+
+    def _default_first(self) -> None:
+        if self.first is not None and not self.first.touched:
+            this = engine.due_date(self.current, self.due.value())
+            self.first.set_period(self.current if this > self.today else self.current.add(1))
+
+    def _day_changed(self) -> None:
+        if self.first is not None:
+            self.first.set_day(self.due.value())
+            self._default_first()
+        self._texts()
+
+    def _texts(self) -> None:
+        if self.apply_from is not None:
+            src = self.src
+            self.apply_from.set_texts(engine.due_date(self.current.add(1), self.due.value()),
+                                      done_text(self.open_due, src.amount, src.currency, src.auto_debit),
+                                      t("when.now_hint", date=fmt_md(self.open_due, weekday=False)))
+            if self.isVisible():
+                self.fit_height()
+
+    @property
+    def from_next(self) -> bool:
+        return self.apply_from is not None and self.apply_from.from_next
+
+    def settle(self) -> tuple[date, float] | None:
+        """This month's payment to record before saving: (date, amount in the old currency)."""
+        if self.from_next:
+            return self.open_due, self.src.amount
+        return None
 
     def result_living(self) -> LivingCost:
         x = LivingCost(**self.src.__dict__) if self.src else LivingCost(created_date=date.today())
@@ -317,6 +550,8 @@ class LivingDialog(FormDialog):
         x.monthly_due_day = self.due.value()
         x.payment_method = self.method.currentData()
         x.last_updated = date.today()  # R14: the edited date is set automatically
+        if self.first is not None:
+            x.start_period = str(self.first.period())
         return x
 
     def validate(self) -> bool:
@@ -512,6 +747,68 @@ class PaymentDialog(FormDialog):
 
 
 # ---------------------------------------------------------------------------------------------------
+INVALID_NAME_CHARS = '\\/:*?"<>|'
+RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def file_name_problem(name: str) -> str:
+    """The text key of what is wrong with a data file name ('' when it works on macOS and Windows)."""
+    text = name.strip()
+    stem = text[:-3] if text.lower().endswith(".db") else text
+    if not stem.strip():
+        return "file.err.empty"
+    if any(ch in INVALID_NAME_CHARS or ord(ch) < 32 for ch in text):
+        return "file.err.chars"
+    if stem.split(".")[0].strip().upper() in RESERVED_NAMES or text.startswith("."):
+        return "file.err.reserved"
+    return ""
+
+
+def db_file_name(name: str) -> str:
+    text = name.strip()
+    return text if text.lower().endswith(".db") else f"{text}.db"
+
+
+class SaveAsDialog(FormDialog):
+    """Save the open data under a new name in the data folder (4.1.2)."""
+
+    def __init__(self, parent: QWidget | None, current_file: Path, folder: Path, today: date):
+        super().__init__(t("saveas.title"), parent, ok_text=t("saveas.ok"))
+        self.folder = Path(folder)
+        self.form.addRow(label(t("saveas.intro", name=current_file.name), "Muted", wrap=True))
+        suggested = paths.unique_path(self.folder, f"{current_file.stem} {today:%Y-%m-%d}.db")
+        self.name = QLineEdit(suggested.stem)
+        self.switch = QCheckBox(t("saveas.switch"))
+        self.switch.setChecked(True)
+        self.row(t("saveas.name"), self.name)
+        self.row("", self.switch, t("saveas.switch_hint"))
+        self.name.textChanged.connect(self._update)
+        self._update()
+        self.name.setFocus()
+        self.name.selectAll()
+
+    def file_name(self) -> str:
+        return db_file_name(self.name.text())
+
+    def _update(self) -> None:
+        self.preview.setText(t("saveas.where", path=paths.display_path(self.folder / self.file_name())))
+
+    def validate(self) -> bool:
+        self.clear_errors(self.name)
+        problem = file_name_problem(self.name.text())
+        if problem:
+            self.fail(t(problem), self.name)
+            return False
+        if (self.folder / self.file_name()).exists():
+            self.fail(t("data.file.exists"), self.name)
+            return False
+        return True
+
+    def values(self) -> tuple[str, bool]:
+        return self.file_name(), self.switch.isChecked()
+
+
+# ---------------------------------------------------------------------------------------------------
 TABLE_COLUMNS = {
     "bills": ("debts.col.name", "debts.col.type", "debts.col.lender", "debts.col.borrower", "debts.col.balance",
               "debts.col.currency", "debts.col.rate", "debts.col.monthly", "debts.col.this_month",
@@ -524,7 +821,8 @@ TABLE_COLUMNS = {
                "living.col.currency", "living.col.method", "living.col.due_day", "living.col.paid",
                "living.col.created", "living.col.updated"),
     "plan": ("plan.col.month", "plan.col.income", "plan.col.debt", "plan.col.living", "plan.col.contrib",
-             "plan.col.net", "plan.col.savings", "plan.col.invest", "plan.col.balance", "plan.col.worth"),
+             "plan.col.net", "plan.col.savings", "plan.col.invest", "plan.col.balance", "plan.col.cash_net",
+             "plan.col.worth"),
     "invest": ("invest.col.name", "invest.col.kind", "invest.col.account", "invest.col.qty", "invest.col.cost",
                "invest.col.price", "invest.col.value", "invest.col.gain", "invest.col.gain_pct", "invest.col.day",
                "invest.col.contrib", "invest.col.currency", "invest.col.source", "invest.col.updated"),

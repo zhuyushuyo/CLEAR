@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QHBoxLayout, QI
 from . import db, engine, i18n, invest, paths, theme
 from .close_wizard import MonthCloseDialog
 from .dialogs import DELETE, TABLE_COLUMNS, BillDialog, CardDialog, ColumnsDialog, DebitDialog, LivingDialog, \
-    PaymentDialog
+    PaymentDialog, SaveAsDialog, file_name_problem
 from .dialogs_invest import HoldingDialog, InvestSettingsDialog, TradeDialog
 from .i18n import fmt_date, fmt_datetime, fmt_md, fmt_period, join_names, money, t
 from .info import APP_NAME, APP_VERSION
@@ -60,6 +60,7 @@ class MainWindow(QMainWindow):
         for page in range(len(PAGES)):
             QShortcut(QKeySequence(f"Ctrl+{page + 1}"), self, activated=lambda p=page: self.navigate(p))
         QShortcut(QKeySequence("F5"), self, activated=self.refresh)
+        QShortcut(QKeySequence("Ctrl+Shift+S"), self, activated=self.save_as)
 
     # ---- layout -----------------------------------------------------------------------------------------
     def _build(self) -> None:
@@ -299,11 +300,26 @@ class MainWindow(QMainWindow):
             self.guard(lambda: self._create(name, open_it=True))
 
     def _create(self, name: str, open_it: bool) -> None:
-        target = self.store.data_dir / (name if name.lower().endswith(".db") else f"{name}.db")
-        if target.exists():
+        problem = file_name_problem(name)
+        if problem:
+            error(self, t(problem))
+            return
+        if self.store.db_file_for(name).exists():
             error(self, t("data.file.exists"))
             return
         self.store.create_db(name, open_it=open_it)
+
+    def save_as(self) -> None:
+        """Save the open data under a new name (4.1.2)."""
+        if not self._need_db():
+            return
+        dlg = SaveAsDialog(self, self.store.db_path, self.store.data_dir, self.store.today())
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, switch = dlg.values()
+        saved: list = []
+        if self.guard(lambda: saved.append(self.store.save_as(name, switch))):
+            self.notify(t("saveas.done_switch" if switch else "saveas.done", name=saved[0].name))
 
     def import_dialog(self) -> None:
         found = paths.find_legacy_databases()
@@ -387,13 +403,15 @@ class MainWindow(QMainWindow):
     def add_bill(self) -> None:
         if not self._need_db():
             return
-        dlg = BillDialog(self, None, self.store.state().current, self.store.currency)
+        dlg = BillDialog(self, None, self.store.state().current, self.store.currency, today=self.store.today())
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.guard(lambda: self.store.add_bill(dlg.result_bill()))
 
     def edit_bill(self, bill) -> None:
         st = self.store.state()
-        dlg = BillDialog(self, bill, st.current, self.store.currency)
+        paid_now = st.paid_bills.get(bill.id)
+        dlg = BillDialog(self, bill, st.current, self.store.currency, today=self.store.today(),
+                         paid=bool(paid_now and paid_now.paid))
         result = dlg.exec()
         if result == DELETE:
             self.delete_bill(bill)
@@ -401,6 +419,17 @@ class MainWindow(QMainWindow):
         if result != QDialog.DialogCode.Accepted:
             return
         new = dlg.result_bill()
+        settle = dlg.settle()
+        if settle is not None:
+            # 4.1.2: this month's payment went out as it was; the edit is for the next one
+            due, amount = settle
+            if self.guard(lambda: self.store.settle_and_update_bill(new, bill, due, amount)):
+                self.notify(t("when.recorded", name=bill.label, date=fmt_md(due, weekday=False),
+                              amount=money(amount, bill.currency)))
+            return
+        if dlg.from_next:  # nothing was due this month: the edit starts with the next payment
+            self.guard(lambda: self.store.update_bill(new))
+            return
         old_balance = bill.amount
         drop = old_balance - new.amount
         if new.currency == bill.currency and drop >= unit(bill.currency):
@@ -493,15 +522,25 @@ class MainWindow(QMainWindow):
     def add_living(self) -> None:
         if not self._need_db():
             return
-        dlg = LivingDialog(self, None, self.store.currency)
+        dlg = LivingDialog(self, None, self.store.currency, today=self.store.today())
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.guard(lambda: self.store.add_living(dlg.result_living()))
 
     def edit_living(self, lc) -> None:
-        dlg = LivingDialog(self, lc, self.store.currency)
+        paid_now = self.store.state().paid_living.get(lc.id)
+        dlg = LivingDialog(self, lc, self.store.currency, today=self.store.today(),
+                           paid=bool(paid_now and paid_now.paid))
         result = dlg.exec()
         if result == QDialog.DialogCode.Accepted:
-            self.guard(lambda: self.store.update_living(dlg.result_living()))
+            new = dlg.result_living()
+            settle = dlg.settle()
+            if settle is None:
+                self.guard(lambda: self.store.update_living(new))
+                return
+            due, amount = settle
+            if self.guard(lambda: self.store.settle_and_update_living(new, lc, due, amount)):
+                self.notify(t("when.recorded", name=lc.label, date=fmt_md(due, weekday=False),
+                              amount=money(amount, lc.currency)))
         elif result == DELETE:
             self.delete_living(lc)
 

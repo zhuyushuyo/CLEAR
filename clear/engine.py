@@ -11,6 +11,8 @@ Money model
 * Due dates falling on a bank holiday move to the next business day (F12).
 * "Overdue" is only said of items paid by hand; an automatic debit past its date is
   "waiting to be recorded" (B2).
+* A debt or living cost can start later (``start_period``, 4.1.2): before its first
+  payment month nothing is due, no interest is added and it is not part of a close.
 """
 
 from __future__ import annotations
@@ -164,6 +166,29 @@ def fee_in_month(card: CreditCard, period: Period) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# First payment month (4.1.2)
+# ---------------------------------------------------------------------------
+def start_of(item: Bill | LivingCost) -> Period | None:
+    """The month of the first payment of a debt or living cost (None: no limit)."""
+    text = getattr(item, "start_period", "") or ""
+    return Period.try_parse(text) if text else None
+
+
+def started(item: Bill | LivingCost, period: Period) -> bool:
+    """True when a payment can be due in `period` (it is not before the first payment month)."""
+    start = start_of(item)
+    return start is None or period >= start
+
+
+def next_period(item: Bill | LivingCost, current: Period, paid: bool) -> Period:
+    """The month of the next payment still to come: this month, the next one once this
+    month is paid, or the first payment month when that is later."""
+    p = current.add(1) if paid else current
+    start = start_of(item)
+    return start if start is not None and start > p else p
+
+
+# ---------------------------------------------------------------------------
 # Single bill
 # ---------------------------------------------------------------------------
 def monthly_interest(bill: Bill, balance: float | None = None) -> float:
@@ -176,7 +201,7 @@ def monthly_interest(bill: Bill, balance: float | None = None) -> float:
 def planned_amount(bill: Bill, period: Period, balance: float | None = None) -> float:
     """What is planned to be paid in `period` when nothing has been recorded yet."""
     bal = bill.amount if balance is None else balance
-    if bal <= 0:
+    if bal <= 0 or not started(bill, period):
         return 0.0
     if bill.is_lump_sum:
         return round_money(bal, bill.currency)
@@ -241,6 +266,9 @@ def project_bill(bill: Bill, start: Period, months: int, paid: PeriodPaid | None
         if bal <= 0:
             rows.append(ScheduleRow(p, 0.0, 0.0, 0.0, 0.0))
             continue
+        if not started(bill, p):  # before the first payment: nothing paid, no interest added
+            rows.append(ScheduleRow(p, 0.0, 0.0, 0.0, bal))
+            continue
         if bill.is_lump_sum:
             rows.append(ScheduleRow(p, bal, 0.0, bal, 0.0))
             bal = 0.0
@@ -271,15 +299,17 @@ def payoff_info(bill: Bill, start: Period, paid: PeriodPaid | None = None) -> Pa
         return PayoffInfo("none")
     interest_now = monthly_interest(bill, bal)
     already = paid is not None and paid.paid
+    k = 1 if already else 0
+    first = start_of(bill)
+    if first is not None and start.add(k) < first:
+        k = start.months_until(first)
     if bill.is_lump_sum:
-        p = start.add(1) if already else start
-        return PayoffInfo("ok", p, 2 if already else 1, 0.0, 0.0)
+        return PayoffInfo("ok", start.add(k), k + 1, 0.0, 0.0)
     if bill.monthly_payment <= 0:
         return PayoffInfo("no_plan", interest_now=interest_now)
     if bill.has_interest and bill.monthly_payment <= interest_now:
         return PayoffInfo("never", interest_now=interest_now)
     total_interest = 0.0
-    k = 1 if already else 0
     p = start.add(k)
     b = bal
     while k < MAX_MONTHS:
@@ -315,6 +345,11 @@ class SimRow:
     @property
     def net_worth(self) -> float:
         return self.savings + self.invest - self.debt
+
+    @property
+    def cash_net(self) -> float:
+        """Savings minus debt: net worth without the investments (4.1.2)."""
+        return self.savings - self.debt
 
 
 def contributions_done(trades: list[Trade]) -> dict[int, float]:
@@ -359,8 +394,18 @@ def simulate(state: State, months: int, rates: dict, target: str) -> list[SimRow
     schedules = [
         (b, project_bill(b, state.current, months, state.paid_bills.get(b.id))) for b in state.bills
     ]
-    cash_living = sum(cv(lc.amount, lc.currency) for lc in state.living if not lc.is_card)
-    card_living = sum(cv(lc.amount, lc.currency) for lc in state.living if lc.is_card)
+
+    def living_in(k: int, p: Period) -> float:
+        """Living costs paid in month k; by card they are paid with the next month's card bill."""
+        total = 0.0
+        for lc in state.living:
+            if lc.is_card:
+                if k == 0 or not started(lc, p.add(-1)):
+                    continue
+            elif not started(lc, p):
+                continue
+            total += cv(lc.amount, lc.currency)
+        return total
 
     # investments: value by kind, growing at the expected yearly return, plus contributions
     folio = invest.summarize(state.holdings, state.prices, rates, target)
@@ -391,7 +436,7 @@ def simulate(state: State, months: int, rates: dict, target: str) -> list[SimRow
         if k == 0:
             income = cv(prof.monthly_income, prof.monthly_income_currency) + cv(
                 prof.other_income, prof.other_income_currency)
-            living = cash_living
+            living = living_in(0, p)
             contrib = first_cash
             trade_cash = trade_in - trade_out
             invest_total = sum(value_by_kind.values()) + first_invest
@@ -402,7 +447,7 @@ def simulate(state: State, months: int, rates: dict, target: str) -> list[SimRow
             income = cv(prof.expected_income, prof.expected_income_currency) + cv(
                 prof.extra_income, prof.extra_income_currency)
             fees = sum(cv(c.annual_fee, c.currency) for c in state.cards if fee_in_month(c, p))
-            living = cash_living + card_living + fees
+            living = living_in(k, p) + fees
             contrib = contrib_total
             trade_cash = 0.0
             for kind in set(value_by_kind) | set(contrib_by_kind):
@@ -539,7 +584,7 @@ def month_items(state: State, rates: dict, target: str) -> list[DueItem]:
     for b in state.bills:
         paid = state.paid_bills.get(b.id)
         is_paid = bool(paid and paid.paid)
-        if b.amount <= 0 and not is_paid:
+        if not is_paid and (b.amount <= 0 or not started(b, cur)):
             continue
         amount = paid.amount if is_paid else planned_amount(b, cur)
         if amount <= 0 and not is_paid:
@@ -553,6 +598,8 @@ def month_items(state: State, rates: dict, target: str) -> list[DueItem]:
             continue
         paid = state.paid_living.get(lc.id)
         is_paid = bool(paid and paid.paid)
+        if not is_paid and not started(lc, cur):
+            continue
         due = due_date(cur, lc.monthly_due_day)
         amount = paid.amount if is_paid else lc.amount
         items.append(DueItem("living", lc.id, lc.label, lc.category, due, amount, lc.currency,
@@ -738,13 +785,15 @@ def close_items(bills: list[Bill], living: list[LivingCost], period: Period, pay
     items: list[CloseItem] = []
     for b in bills:
         rec = paid_b.get(b.id)
-        if b.amount <= 0 and not (rec and rec.paid):
+        if not (rec and rec.paid) and (b.amount <= 0 or not started(b, period)):
             continue
         items.append(CloseItem("bill", b.id, b.label, b.bill_type, b.currency,
                                planned_amount(b, period), rec, due_date(period, b.monthly_due_day),
                                monthly_interest(b)))
     for lc in living:
         rec = paid_l.get(lc.id)
+        if not (rec and rec.paid) and not started(lc, period):
+            continue
         items.append(CloseItem("living", lc.id, lc.label, lc.category, lc.currency,
                                round_money(lc.amount, lc.currency), rec, due_date(period, lc.monthly_due_day),
                                0.0, lc.is_card))

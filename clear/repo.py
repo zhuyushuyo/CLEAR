@@ -333,6 +333,27 @@ class Repository:
         with closing(self._conn()) as c, db.tx(c):
             db.insert_living_payment(c, lc_id, period, paid_date, amount, currency, note)
 
+    def settle_and_update_bill(self, bill: Bill, period: Period, paid_date: date, amount: float,
+                               interest: float | None, keep_balance: bool, note: str = "") -> Payment:
+        """Record this month's payment with the debt as it is saved now, then save the edited debt
+        (4.1.2: the edit applies from the next payment). With keep_balance the balance is the one
+        left after the payment; otherwise it is the edited one. One transaction."""
+        with closing(self._conn()) as c, db.tx(c):
+            pay = db.insert_bill_payment(c, bill.id, period, paid_date, amount, interest, note)
+            if keep_balance:
+                bill.amount = pay.balance_after
+            c.execute(f"UPDATE bills SET {', '.join(x + '=?' for x in db.BILL_COLUMNS)} WHERE id=?",
+                      (*db.bill_values(bill), bill.id))
+            return pay
+
+    def settle_and_update_living(self, lc: LivingCost, period: Period, paid_date: date, amount: float,
+                                 currency: str, note: str = "") -> None:
+        """Record this month's living cost with its saved amount, then save the edit. One transaction."""
+        with closing(self._conn()) as c, db.tx(c):
+            db.insert_living_payment(c, lc.id, period, paid_date, amount, currency, note)
+            c.execute(f"UPDATE living_costs SET {', '.join(x + '=?' for x in db.LIVING_COLUMNS)} WHERE id=?",
+                      (*db.living_values(lc), lc.id))
+
     def undo_last_payment(self, target_type: str, target_id: int, period: Period) -> bool:
         """Remove the latest payment of the month for the item and restore the balance."""
         with closing(self._conn()) as c, db.tx(c):

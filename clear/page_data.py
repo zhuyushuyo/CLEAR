@@ -6,6 +6,7 @@ import platform
 import sys
 
 from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR, Qt
+from PyQt6.QtGui import QKeySequence
 from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QFormLayout, QGridLayout, QHBoxLayout,
                              QHeaderView, QTableWidget, QVBoxLayout)
 
@@ -58,6 +59,13 @@ class DataPage(Page):
         row = QHBoxLayout()
         row.addWidget(button(t("data.file.new"), None, "fa5s.plus", window.new_file))
         row.addWidget(button(t("data.file.open"), None, "fa5s.folder-open", window.open_file_dialog))
+        self.save_as_btn = button(t("data.file.save_as"), None, "fa5s.copy", window.save_as)
+        keys = QKeySequence("Ctrl+Shift+S").toString(QKeySequence.SequenceFormat.NativeText)
+        self.save_as_btn.setToolTip(t("data.file.save_as_tip", keys=keys))
+        row.addWidget(self.save_as_btn)
+        row.addStretch(1)
+        c.body.addLayout(row)
+        row = QHBoxLayout()
         row.addWidget(button(t("data.file.import"), None, "fa5s.file-import", window.import_dialog))
         row.addStretch(1)
         c.body.addLayout(row)
@@ -183,6 +191,7 @@ class DataPage(Page):
             self.file_label.setProperty("tone", "")
         else:
             self.file_label.setText(t("data.file.none"))
+        self.save_as_btn.setEnabled(store.has_db)
 
         items = store.backups()
         self._backup_paths = [b.path for b in items]

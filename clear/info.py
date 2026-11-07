@@ -2,11 +2,12 @@
 
 APP_NAME = "CLEAR"
 APP_FULL_NAME = "Cashflow, Loans, Expenses, Assets & Repayment"
-APP_VERSION = "4.1.1"
+APP_VERSION = "4.1.2"
 APP_AUTHOR = "Yu ZHU"
 LEGACY_APP_NAME = "Payback Management"
 REPO_URL = "https://github.com/zhuyushuyo/CLEAR"
 
 # Version of the database layout written by this app (stored in PRAGMA user_version).
-# 0 = Payback Management 3.x (no version stamp), 1 = CLEAR 4.0, 2 = CLEAR 4.1 (investments).
-SCHEMA_VERSION = 2
+# 0 = Payback Management 3.x (no version stamp), 1 = CLEAR 4.0, 2 = CLEAR 4.1 (investments),
+# 3 = CLEAR 4.1.2 (first payment month of debts and living costs).
+SCHEMA_VERSION = 3

@@ -248,15 +248,27 @@ def test_config_from_40_moves_saved_columns(tmp_path):
         "column_widths": {"cards": [110, 150, 60, 100, 100, 100, 60, 84, 126, 126, 90, 90, 56, 112, 96],
                           "plan": [150, 101, 102, 103, 104, 105, 106, 107]}}), encoding="utf-8")
     cfg = load_config(path)
-    assert cfg.columns_version == 2
+    assert cfg.columns_version == 3
     assert cfg.hidden("cards") == {13}             # fee status merged into the fee column; "updated" 14 -> 13
     assert cfg.hidden("plan") == {6}               # savings 5 -> 6 (contributions and investments added)
     assert cfg.hidden("invest") == {11, 12, 13} and cfg.hidden("bills") == {13}
     cards, plan = cfg.column_widths["cards"], cfg.column_widths["plan"]
     assert len(cards) == 14 and cards[10] == 210 and cards[11:] == [56, 112, 96]
-    assert plan == [150, 101, 102, 103, 0, 104, 105, 0, 106, 107]
+    assert plan == [150, 101, 102, 103, 0, 104, 105, 0, 106, 0, 107]   # 4.1.2: savings - debt before net worth
     save_config(cfg, path)
     assert load_config(path).hidden("cards") == {13}  # moved once only
+
+
+def test_config_from_41_moves_the_net_worth_column(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"columns_version": 2, "hidden_columns": {"plan": [3, 9], "invest": [11]}}),
+                    encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.columns_version == 3
+    assert cfg.hidden("plan") == {3, 10}           # net worth 9 -> 10
+    assert cfg.hidden("invest") == {11}            # other tables are left alone
+    save_config(cfg, path)
+    assert load_config(path).hidden("plan") == {3, 10}
 
 
 def test_paths(tmp_path):

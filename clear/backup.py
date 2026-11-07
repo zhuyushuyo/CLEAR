@@ -28,7 +28,9 @@ def backup_dir(backups_root: Path, db_path: Path) -> Path:
     return Path(backups_root) / Path(db_path).stem
 
 
-def _copy_db(src: Path, dst: Path) -> None:
+def copy_db(src: Path, dst: Path) -> None:
+    """A consistent copy of a database file (SQLite online backup), written to a temporary
+    file first so that `dst` is never left half written."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(".tmp")
     if tmp.exists():
@@ -49,7 +51,7 @@ def make_backup(db_path: Path, backups_root: Path, reason: str = "manual", keep:
     while dest.exists():
         n += 1
         dest = folder / f"{db_path.stem}{SEP}{now:%Y%m%d-%H%M%S}-{n}{SEP}{reason}.db"
-    _copy_db(db_path, dest)
+    copy_db(db_path, dest)
     prune(folder, keep)
     log.info("backup %s (%s)", dest.name, reason)
     return dest
@@ -102,6 +104,6 @@ def has_backup_today(db_path: Path, backups_root: Path, reason: str, now: dateti
 def restore(backup_path: Path, db_path: Path, backups_root: Path) -> Path:
     """Replace the database with a backup. The current state is saved first."""
     safety = make_backup(db_path, backups_root, "restore")
-    _copy_db(Path(backup_path), Path(db_path))
+    copy_db(Path(backup_path), Path(db_path))
     log.info("restored %s from %s", Path(db_path).name, Path(backup_path).name)
     return safety

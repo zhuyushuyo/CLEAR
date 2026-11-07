@@ -146,6 +146,33 @@ def make_v40(path: Path) -> Path:
     return path
 
 
+def make_v41(path: Path) -> Path:
+    """Layout written by CLEAR 4.1.0 / 4.1.1 (user_version 2): no first payment month."""
+    from clear import db
+
+    added_columns = {("bills", "start_period"), ("living_costs", "start_period")}
+    conn = sqlite3.connect(path)
+    for table, cols in db.SCHEMA.items():
+        body = ", ".join(f"{name} {decl}" for name, decl in cols if (table, name) not in added_columns)
+        conn.execute(f"CREATE TABLE {table} ({body})")
+    conn.executemany("""INSERT INTO bills (bill_type, bill_name, lender_name, amount, currency, interest_rate,
+        monthly_payment, monthly_due_day, created_date, sort_order, auto_debit) VALUES (?,?,?,?,?,?,?,?,?,?,?)""", [
+        ("card_loan", "Loan A", "Bank A", 650000, "JPY", 14.0, 25000, 2, "2025-06-01", 1, 1),
+        ("shopping credit", "Card bill", "Card Co", 30000, "JPY", 0.0, 0, 2, "2025-06-01", 2, 1),
+    ])
+    conn.execute("""INSERT INTO living_costs (category, name, amount, currency, monthly_due_day, payment_method,
+        created_date, last_updated) VALUES ('Utilities', 'Power', 12000, 'JPY', 2, 'Auto Debit', '2025-06-01',
+        '2025-06-01')""")
+    conn.executemany("INSERT INTO savings VALUES (?, ?)", [("cumulative_savings", "180000"),
+                                                           ("monthly_income", "320000"), ("income_payment_day", "25")])
+    conn.executemany("INSERT INTO meta VALUES (?, ?)", [("schema_version", "2"), ("app_version", "4.1.1"),
+                                                        ("last_closed_period", "2026-10")])
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+    conn.close()
+    return path
+
+
 @pytest.fixture
 def today() -> date:
     return TODAY
